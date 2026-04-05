@@ -8731,7 +8731,10 @@ try {
             $isDailyGamePosted = true;
         } elseif ($cfgPick >= 2 && $cfgPick <= 5 && $cfgMainMax > 0 && $cfgMainMax <= 9 && !$cfgHasExtra) {
             $isDailyGamePosted = true;
-        } elseif ($pickLengthPosted >= 2 && $pickLengthPosted <= 5 && !$cfgHasExtra && $cfgMainMax > 0 && $cfgMainMax <= 9) {
+        } elseif ($pickLengthPosted >= 2 && $pickLengthPosted <= 5 && !$cfgHasExtra) {
+            // pick_length is only set by skaiPrepareAiSave for digit (daily) games (maxMain <= 9).
+            // Do NOT require $cfgMainMax > 0 here: $lotteryConfig is always empty [] at save time
+            // because the config-loading block runs AFTER this save handler in the page order.
             $isDailyGamePosted = true;
         }
 
@@ -8962,7 +8965,55 @@ $labelInput = implode(' - ', $parts);
             }
         }
 
-        $dailyDisplayMain = '';
+        // [FIX-EVIDENCE-RECOVERY] Last-resort recovery from top_combos_json evidence.
+        // wireEvidence (document capture phase) always populates top_combos_json before
+        // interceptSaveForm serialises the form; so $evidenceDecoded is the most reliable
+        // source when numbers_json / main_numbers fields are empty (which happens because
+        // interceptSaveForm's stopPropagation() prevents skaiPrepareAiSave from running).
+        if (empty($mainArr) && is_array($evidenceDecoded)) {
+            // Step 1: detect daily game from evidence payload
+            if (!$isDailyGamePosted) {
+                if (!empty($evidenceDecoded['is_daily_game'])
+                    || !empty($evidenceDecoded['daily_chosen_combos'])) {
+                    $isDailyGamePosted = true;
+                    skai_debug_log('[SKAI SAVE TRACE] isDailyGamePosted_recovered_from_evidence=1');
+                }
+            }
+            // Step 2: extract main numbers and pre-populate $nums['daily_top_combo_strings']
+            // so the $dailyDisplaySet builder below can use the existing code path.
+            if ($isDailyGamePosted && !empty($evidenceDecoded['daily_chosen_combos']) && is_array($evidenceDecoded['daily_chosen_combos'])) {
+                $__recoveredDisplays = [];
+                foreach ($evidenceDecoded['daily_chosen_combos'] as $__dccRow) {
+                    if (!is_array($__dccRow)) { continue; }
+                    $__dccDisp = '';
+                    if (!empty($__dccRow['display'])) {
+                        $__dccDisp = preg_replace('/[^0-9]/', '', (string)$__dccRow['display']);
+                    } elseif (!empty($__dccRow['combo']) && is_array($__dccRow['combo'])) {
+                        $__dccDisp = implode('', array_map('intval', $__dccRow['combo']));
+                    } elseif (!empty($__dccRow['values'])) {
+                        $__dccDisp = preg_replace('/[^0-9]/', '', (string)$__dccRow['values']);
+                    }
+                    if ($__dccDisp !== '') { $__recoveredDisplays[] = $__dccDisp; }
+                    if (count($__recoveredDisplays) >= 5) { break; }
+                }
+                if (!empty($__recoveredDisplays)) {
+                    // Inject into $nums so the standard $dailyDisplaySet builder uses it
+                    if (!is_array($nums)) { $nums = []; }
+                    $nums['daily_top_combo_strings'] = $__recoveredDisplays;
+                    // Set $mainArr from first combo digits for downstream range checks
+                    $mainArr = array_map('intval', str_split((string)$__recoveredDisplays[0]));
+                    skai_debug_log('[SKAI SAVE TRACE] main_numbers_recovered_from_evidence=1 display=' . (string)$__recoveredDisplays[0]);
+                }
+            } elseif (!$isDailyGamePosted && !empty($evidenceDecoded['final_prediction_sets']) && is_array($evidenceDecoded['final_prediction_sets'])) {
+                $__fps0 = $evidenceDecoded['final_prediction_sets'][0] ?? [];
+                if (!empty($__fps0['values']) && is_array($__fps0['values'])) {
+                    $mainArr = array_map('intval', $__fps0['values']);
+                    skai_debug_log('[SKAI SAVE TRACE] main_numbers_recovered_from_fps_evidence=1');
+                }
+            }
+        }
+
+
         $dailyDisplaySet = [];
         if ($isDailyGamePosted) {
             if (!empty($nums['daily_top_combo_strings']) && is_array($nums['daily_top_combo_strings'])) {
@@ -48863,6 +48914,88 @@ document.addEventListener('DOMContentLoaded', function () {
     } catch (_) {}
   }
 
+  // [FIX-INTERCEPT-POPULATE] Helper called by interceptSaveForm BEFORE form serialization.
+  // Populates numbers_json, main_numbers, main_numbers_csv, daily_top_combos_json, pick_length,
+  // and allow_zero from the live SKAI globals that are guaranteed to exist after a run.
+  // This is necessary because the document-level bubble-phase submit handler (Block B /
+  // skaiPrepareAiSave) never fires when interceptSaveForm calls stopPropagation() during
+  // the form's capture/target phase.
+  window._skaiPopulateFormFields = function(form) {
+    if (!form) { return; }
+    var _meta    = window.SKAI_META || {};
+    var _isDaily = !!(_meta.isDailyDigitGame || _meta.isDaily) && !_meta.isStandardLotteryGame;
+    var _pick    = parseInt(_meta.pick || _meta.pickSize || _meta.pickMain || 0, 10) || 0;
+
+    // Only write to a field when it is currently empty / unpopulated to avoid stomping over
+    // values that a prior code path already set correctly.
+    var _set = function(name, val) {
+      if (val === null || val === undefined || val === '') { return; }
+      var fld = form.querySelector('input[name="' + name + '"]');
+      if (fld && (fld.value === '' || fld.value === '[]' || fld.value === 'null')) {
+        try { fld.value = String(val); } catch(_) {}
+      }
+    };
+
+    if (_isDaily && window.SKAI_DAILY_CHOSEN_COMBOS && window.SKAI_DAILY_CHOSEN_COMBOS.length) {
+      var _combos   = window.SKAI_DAILY_CHOSEN_COMBOS;
+      var _first    = _combos[0] || {};
+      var _firstArr = Array.isArray(_first.combo) ? _first.combo
+                    : (Array.isArray(_first.main) ? _first.main : []);
+      var _displays = [];
+      var _dtcArr   = [];
+      var _extraArr = (window.SKAI_DAILY_EXTRA_DIGITS || []).slice(0, 3);
+      for (var _ci = 0; _ci < _combos.length && _ci < 5; _ci++) {
+        var _cc = Array.isArray(_combos[_ci].combo) ? _combos[_ci].combo
+                : (Array.isArray(_combos[_ci].main) ? _combos[_ci].main : []);
+        var _cd = (typeof window.SKAI_formatDailyComboDisplay === 'function')
+          ? window.SKAI_formatDailyComboDisplay(_cc, _pick || _cc.length)
+          : _cc.join('');
+        if (_cd) {
+          _displays.push(_cd);
+          _dtcArr.push({ rank: _ci + 1, combo: _cc.slice(), display: _cd, score: (_combos[_ci].score || 0), approxPct: (_combos[_ci].approxPct || 0) });
+        }
+      }
+      if (_displays.length) {
+        var _numJson = {
+          main_numbers:               _displays.slice(),
+          extra_numbers:              _extraArr.slice(),
+          daily_top_combo_strings:    _displays.slice(),
+          daily_primary_combo_digits: _firstArr.slice(),
+          daily_primary_combo_display: _displays[0]
+        };
+        _set('numbers_json',          JSON.stringify(_numJson));
+        _set('main_numbers',          JSON.stringify(_displays));
+        _set('main_numbers_csv',      _displays.join(','));
+        try { _set('daily_top_combos_json', JSON.stringify(_dtcArr)); } catch(_) {}
+        if (_pick > 0) { _set('pick_length', String(_pick)); }
+        _set('allow_zero', '1');
+      }
+    } else if (!_isDaily) {
+      // Standard lottery: populate from skaiSaveMainOrdered / SKAI_FINAL_PREDICTION_SETS
+      var _stdMain  = (window.skaiSaveMainOrdered && window.skaiSaveMainOrdered.length)
+                    ? window.skaiSaveMainOrdered.slice(0, 20)
+                    : [];
+      var _stdExtra = (window.skaiSaveExtraOrdered && window.skaiSaveExtraOrdered.length)
+                    ? window.skaiSaveExtraOrdered.slice(0, 5)
+                    : [];
+      if (!_stdMain.length && window.SKAI_FINAL_PREDICTION_SETS && window.SKAI_FINAL_PREDICTION_SETS.length) {
+        var _fps0 = window.SKAI_FINAL_PREDICTION_SETS[0] || {};
+        _stdMain = Array.isArray(_fps0.main) ? _fps0.main.slice()
+                 : (Array.isArray(_fps0.values) ? _fps0.values.slice() : []);
+      }
+      if (_stdMain.length) {
+        var _stdJson = { main_numbers: _stdMain, extra_numbers: _stdExtra };
+        _set('numbers_json',     JSON.stringify(_stdJson));
+        _set('main_numbers',     JSON.stringify(_stdMain));
+        _set('main_numbers_csv', _stdMain.join(','));
+        if (_stdExtra.length) {
+          _set('extra_ball_numbers',     JSON.stringify(_stdExtra));
+          _set('extra_ball_numbers_csv', _stdExtra.join(','));
+        }
+      }
+    }
+  };
+
   function interceptSaveForm(form) {
     if (!form || form.__skaiSaveIntercepted) { return; }
     form.__skaiSaveIntercepted = true;
@@ -48876,6 +49009,16 @@ document.addEventListener('DOMContentLoaded', function () {
 
       var hint = form.querySelector("[id$=save-hint], [id$=-save-hint]");
       if (hint) { hint.textContent = "Saving..."; }
+
+      // [FIX-INTERCEPT-POPULATE] Proactively populate prediction fields from SKAI globals.
+      // The document-level bubble-phase submit handler (Block B / skaiPrepareAiSave) NEVER
+      // fires because stopPropagation() above prevents the event from reaching the document
+      // in the bubble phase.  Without this call, numbers_json / main_numbers /
+      // daily_top_combos_json are always empty in the POST body and PHP returns
+      // {"ok":false,"reason":"empty_main_numbers"} for every save.
+      if (typeof window._skaiPopulateFormFields === 'function') {
+        try { window._skaiPopulateFormFields(form); } catch (_ppErr) {}
+      }
 
       var data = [];
       var inputs = form.elements;
