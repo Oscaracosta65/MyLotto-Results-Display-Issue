@@ -2421,6 +2421,15 @@ if ($doGroupDelete && ($predictionTargetIdPost !== '' || ($lotteryId && $drawDat
         $__delSnCols = is_array($__delSnColsRaw) ? array_keys($__delSnColsRaw) : array();
     } catch (\Throwable $__delE) { $__delSnCols = array(); }
 
+    // Helper: build the draw-date WHERE fragment using target_draw_date (COALESCE) when the
+    // column exists, or next_draw_date as the sole fallback.  Reused in both branches below.
+    $__buildDateCond = function ($date) use ($db, $__delSnCols) {
+        if (in_array('target_draw_date', $__delSnCols, true)) {
+            return 'DATE(COALESCE(' . $db->quoteName('target_draw_date') . ',' . $db->quoteName('next_draw_date') . ')) = ' . $db->quote($date);
+        }
+        return 'DATE(' . $db->quoteName('next_draw_date') . ') = ' . $db->quote($date);
+    };
+
     $q = $db->getQuery(true)
         ->delete($db->quoteName('#__user_saved_numbers'))
         ->where($db->quoteName('user_id') . ' = ' . (int) $user->id);
@@ -2432,16 +2441,10 @@ if ($doGroupDelete && ($predictionTargetIdPost !== '' || ($lotteryId && $drawDat
     // The OR ensures legacy rows without a populated prediction_target_id are also removed.
     $hasPtidCol = in_array('prediction_target_id', $__delSnCols, true);
     if ($predictionTargetIdPost !== '' && $hasPtidCol && $lotteryId && $drawDate !== '') {
-        // Build the date-part of the OR fallback
-        if (in_array('target_draw_date', $__delSnCols, true)) {
-            $__dateCond = 'DATE(COALESCE(' . $db->quoteName('target_draw_date') . ',' . $db->quoteName('next_draw_date') . ')) = ' . $db->quote($drawDate);
-        } else {
-            $__dateCond = 'DATE(' . $db->quoteName('next_draw_date') . ') = ' . $db->quote($drawDate);
-        }
         $q->where(
             '(' .
             $db->quoteName('prediction_target_id') . ' = ' . $db->quote($predictionTargetIdPost) .
-            ' OR (' . $db->quoteName('lottery_id') . ' = ' . $lotteryId . ' AND ' . $__dateCond . ')' .
+            ' OR (' . $db->quoteName('lottery_id') . ' = ' . $lotteryId . ' AND ' . $__buildDateCond($drawDate) . ')' .
             ')'
         );
     } elseif ($predictionTargetIdPost !== '' && $hasPtidCol) {
@@ -2449,11 +2452,7 @@ if ($doGroupDelete && ($predictionTargetIdPost !== '' || ($lotteryId && $drawDat
     } else {
         $q->where($db->quoteName('lottery_id') . ' = ' . $lotteryId);
         if ($drawDate !== '') {
-            if (in_array('target_draw_date', $__delSnCols, true)) {
-                $q->where('DATE(COALESCE(' . $db->quoteName('target_draw_date') . ', ' . $db->quoteName('next_draw_date') . ')) = ' . $db->quote($drawDate));
-            } else {
-                $q->where('DATE(' . $db->quoteName('next_draw_date') . ') = ' . $db->quote($drawDate));
-            }
+            $q->where($__buildDateCond($drawDate));
         }
         if ($targetDrawSessionPost !== '' && in_array('target_draw_session', $__delSnCols, true)) {
             $q->where('LOWER(TRIM(COALESCE(' . $db->quoteName('target_draw_session') . ', ' . $db->quoteName('draw_session') . '))) = ' . $db->quote($targetDrawSessionPost));
@@ -8248,8 +8247,9 @@ function mylottoexpertExtractDrawNumbersFromRow($gameId, $row)
     // Daily games are protected: their draw_results is a plain digit string ('502', etc.)
     // which does NOT match the /^\d+(?:-\d+){2,}$/ pattern and is therefore skipped.
     if (empty($result['main']) && array_key_exists('draw_results', $row) && $row['draw_results'] !== '' && $row['draw_results'] !== null) {
-        // Strip optional '+E' extra-ball suffix before matching.
-        $__drStripped = preg_replace('/\+.*$/', '', (string)$row['draw_results']);
+        // Strip optional '+E' extra-ball suffix (e.g. '7-14-21-33-48+3') before matching.
+        // Use /\+\d+$/ so only a numeric +Bonus tail is removed; other '+' characters are kept.
+        $__drStripped = preg_replace('/\+\d+$/', '', (string)$row['draw_results']);
         // Require at least 3 dash-separated parts (e.g. 'N-N-N') to distinguish a regular
         // lottery ball list from a plain digit string used by daily games ('502', '1234', etc.)
         if (preg_match('/^\d+(?:-\d+){2,}$/', trim($__drStripped))) {
