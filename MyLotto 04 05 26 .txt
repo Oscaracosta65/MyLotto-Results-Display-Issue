@@ -7909,7 +7909,28 @@ function getDrawByDate($gameId, $date, $db, $drawSession = null, $drawAt = null)
         ->setLimit(1);
 
     $db->setQuery($query);
-    return $db->loadAssoc();
+    $__mleGdbResult = $db->loadAssoc();
+    // [FIX-SESSION-FALLBACK] If the session-filtered query returned no row, retry with a
+    // date-only filter. Session labels stored in the draw table (e.g. 'EVE', 'EV') may not
+    // match the normalized canonical session key saved by SKAI at prediction time (e.g.
+    // 'evening'). Retrying without the session WHERE clause ensures the draw is found as
+    // long as a row exists for that date, while still using draw_at proximity ordering for
+    // the closest match when multiple draws share the same date.
+    if (!is_array($__mleGdbResult) && $drawSession !== '' && in_array('draw_session', $__drawCols, true)) {
+        $__queryFb = $db->getQuery(true)
+            ->select('*')
+            ->from($db->quoteName($realTable))
+            ->where($db->quoteName('game_id') . ' = ' . $db->quote((string)$gameId))
+            ->where('DATE(' . $db->quoteName('draw_date') . ') = ' . $db->quote($dateOnly));
+        if ($drawAtNorm !== '' && in_array('draw_date', $__drawCols, true)) {
+            $__queryFb->order('ABS(TIMESTAMPDIFF(SECOND,' . $db->quote($drawAtNorm) . ',' . $db->quoteName('draw_date') . ')) ASC');
+        }
+        $__queryFb->order($db->quoteName('draw_date') . ' DESC')
+            ->setLimit(1);
+        $db->setQuery($__queryFb);
+        $__mleGdbResult = $db->loadAssoc();
+    }
+    return is_array($__mleGdbResult) ? $__mleGdbResult : null;
 }
 
 /**
@@ -8050,11 +8071,17 @@ function mylottoexpertExtractDrawNumbersFromRow($gameId, $row)
     // Final defensive fallback: if this is a raw draw row with numeric fields but no config match,
     // scan numeric fields while excluding common metadata and already-used extra fields.
     if (empty($result['main'])) {
+        // [FIX-DRAW-RESULTS] draw_results is a composite representation string (e.g. '502' for
+        // Pick3, or '5-12-23-33-42' for regular lotteries). It must be excluded from the
+        // defensive scan so it is never mistaken for a single ball value. Without this exclusion,
+        // '502' would be read as intval 502 and inserted BEFORE the real ordinal columns
+        // (first, second, third...) which appear later in the row, causing positional misalignment
+        // in daily combo comparison and producing 0 hits for a correct Pick3 prediction.
         $metaFields = array(
             'id','asset_id','state','ordering','checked_out','checked_out_time',
             'created_by','modified_by','country','stateprov_name','stateprov_id',
             'game_id','game_name','draw_date','next_draw_date','next_jackpot',
-            'req_date'
+            'req_date','draw_results'
         );
         $__extraColSet = array_flip($extrasArr);
         foreach ($row as $k => $v) {
@@ -8593,9 +8620,13 @@ function scoreRunFromDrawMap($drawMap, $gameId, $drawDate, array $predMain, $pre
     }
 
     // Count main-ball hits
+    // [FIX-DAILY-ZERO] Do not skip digit 0: for daily lotteries (Pick3/4/5), 0 is a valid
+    // ball digit and must be counted as a hit when it appears in both prediction and draw.
+    // For regular lotteries, drawMain never contains 0 (balls are 1-based, e.g. 1-49), so
+    // removing the $n !== 0 guard does not affect regular lottery hit counting.
     $hitsMain = 0;
     foreach ($predMain as $n) {
-        if ($n !== 0 && in_array((int)$n, $drawMain, true)) {
+        if (in_array((int)$n, $drawMain, true)) {
             $hitsMain++;
         }
     }
@@ -9212,7 +9243,8 @@ foreach ($groups as $groupKey => $g) {
                             $__bk = 'main_' . $__bi;
                             if (isset($__bkRow[$__bk]) && $__bkRow[$__bk] !== '' && $__bkRow[$__bk] !== null) {
                                 $__bv = (int)$__bkRow[$__bk];
-                                if ($__bv) { $__bkMain[] = $__bv; }
+                                // [FIX-DAILY-ZERO] Allow digit 0 for daily games (Pick3/4/5 use 0 as a valid digit).
+                                if ($__isDailyPred || $__bv !== 0) { $__bkMain[] = $__bv; }
                             }
                         }
                         // Read all extra_ball_N aliases (cap at 10; breaks on first absent alias)
@@ -9220,7 +9252,8 @@ foreach ($groups as $groupKey => $g) {
                             $__bek = $__bei === 0 ? 'extra_ball' : 'extra_ball_' . ($__bei + 1);
                             if (isset($__bkRow[$__bek]) && $__bkRow[$__bek] !== '' && $__bkRow[$__bek] !== null) {
                                 $__bv = (int)$__bkRow[$__bek];
-                                if ($__bv) { $__bkExtra[] = $__bv; }
+                                // [FIX-DAILY-ZERO] Allow digit 0 for daily games.
+                                if ($__isDailyPred || $__bv !== 0) { $__bkExtra[] = $__bv; }
                             } else {
                                 break;
                             }
@@ -9461,7 +9494,22 @@ foreach ($groups as $__gKey => $__g) {
     if (!array_key_exists($__fbCacheKey, $__prcDrawCache)) {
         $__grpMain  = array();
         $__grpExtra = array();
-        $__groupHasDaily = false;
+        // [FIX-DAILY-FLAG] Initialize the daily flag from the group-level canonical target
+        // metadata FIRST, before probing individual prediction rows. A prediction that was
+        // saved with target_prediction_family='daily' (set by SKAI at save time) must always
+        // be treated as a daily game for draw extraction purposes, regardless of whether
+        // structured daily JSON fields (daily_top_picks_json etc.) are present. This ensures:
+        //   1. Digit 0 is allowed in draw number extraction (valid Pick3/4/5 digit).
+        //   2. The daily raw-row fallback (getDrawByDate on empty drawMap result) runs.
+        // Without this, a daily prediction lacking combo_strings would leave $__groupHasDaily
+        // false, silently exclude the 0 digit, and leave has_draw=false even when the draw occurred.
+        $__groupHasDaily = (strtolower(trim((string)($__g['target_prediction_family'] ?? ''))) === 'daily');
+        if (!$__groupHasDaily) {
+            $__tpt = strtolower(trim((string)($__g['target_prediction_type'] ?? '')));
+            if ($__tpt === 'pick3' || $__tpt === 'pick4' || $__tpt === 'pick5' || $__tpt === 'daily') {
+                $__groupHasDaily = true;
+            }
+        }
         // Probe predictions to detect daily games AND determine how many extra balls are expected.
         // For EuroMillions the extra_ball_numbers field stores both Lucky Stars (e.g. "3,7"),
         // so the prediction count tells us the game has 2 extras even when config only lists 1 column.
@@ -9469,7 +9517,10 @@ foreach ($groups as $__gKey => $__g) {
         foreach (($__g['preds'] ?? array()) as $__predProbe) {
             if (!$__groupHasDaily) {
                 $__dailyProbe = mylottoexpertExtractDailySavedView($__predProbe);
-                if (!empty($__dailyProbe['is_daily']) && !empty($__dailyProbe['combo_strings'])) {
+                // [FIX-DAILY-FLAG] Use is_daily alone (not requiring combo_strings) so that
+                // predictions flagged daily via prediction_family but lacking structured JSON
+                // fields still correctly set the daily gate.
+                if (!empty($__dailyProbe['is_daily'])) {
                     $__groupHasDaily = true;
                 }
             }

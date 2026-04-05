@@ -8991,11 +8991,29 @@ $labelInput = implode(' - ', $parts);
                 }
             }
             if (empty($dailyDisplaySet) && !empty($mainArr) && is_array($mainArr)) {
-                foreach ($mainArr as $__dailyMainRow) {
-                    if (is_array($__dailyMainRow) || is_object($__dailyMainRow)) { continue; }
-                    $__dailyMainDisp = preg_replace('/[^0-9]/', '', (string)$__dailyMainRow);
-                    if ($__dailyMainDisp !== '') { $dailyDisplaySet[] = $__dailyMainDisp; }
-                    if (count($dailyDisplaySet) >= 5) { break; }
+                // [FIX-SKAI-COMBO-JOIN] Detect whether mainArr contains individual digit values
+                // (e.g. [5, 0, 2] from an AI output that returned per-digit arrays) rather than
+                // full combo strings (e.g. ['502', '183']). When all elements are single digits
+                // (0-9), join them into one combo string so daily_top_picks_json is stored as
+                // ['502'] not ['5','0','2']. The latter causes MyLottoExpert to compare single-digit
+                // combos against multi-digit draw strings and report 0 hits for a correct prediction.
+                $__skaiAllSingleDigits = true;
+                foreach ($mainArr as $__smItem) {
+                    if (is_array($__smItem) || is_object($__smItem)) { $__skaiAllSingleDigits = false; break; }
+                    $__smStr = preg_replace('/[^0-9]/', '', (string)$__smItem);
+                    if (strlen($__smStr) !== 1) { $__skaiAllSingleDigits = false; break; }
+                }
+                if ($__skaiAllSingleDigits && count($mainArr) >= 2) {
+                    // Individual digit values: join as one combo string
+                    $__skaiJoined = implode('', array_map(function($d) { return (string)(int)$d; }, $mainArr));
+                    if ($__skaiJoined !== '') { $dailyDisplaySet[] = $__skaiJoined; }
+                } else {
+                    foreach ($mainArr as $__dailyMainRow) {
+                        if (is_array($__dailyMainRow) || is_object($__dailyMainRow)) { continue; }
+                        $__dailyMainDisp = preg_replace('/[^0-9]/', '', (string)$__dailyMainRow);
+                        if ($__dailyMainDisp !== '') { $dailyDisplaySet[] = $__dailyMainDisp; }
+                        if (count($dailyDisplaySet) >= 5) { break; }
+                    }
                 }
             }
             if ($dailyDisplayMain === '' && !empty($dailyDisplaySet)) {
