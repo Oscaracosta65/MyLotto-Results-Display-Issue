@@ -3855,6 +3855,108 @@ h3.title { font-size: 1.5rem; }
 .lottery-group.collapsed .sdi-draw-date {
   font-size: 0.78rem;
 }
+
+/* ── Outer lottery grouping wrapper ──────────────────────────────── */
+.mle-lottery-outer {
+  margin-bottom: 2.25rem;
+}
+.mle-lottery-outer-header {
+  display: -webkit-flex;
+  display: flex;
+  -webkit-align-items: center;
+  align-items: center;
+  gap: 0.6rem;
+  background: #1e293b;
+  color: #f1f5f9;
+  border-radius: 10px 10px 0 0;
+  padding: 0.65rem 1.1rem;
+  cursor: pointer;
+  user-select: none;
+}
+.mle-lottery-outer.body-collapsed .mle-lottery-outer-header {
+  border-radius: 10px;
+}
+.mle-lottery-outer-logo {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  flex-shrink: 0;
+  background: #fff;
+  border-radius: 4px;
+  padding: 2px;
+}
+.mle-lottery-outer-logo-fallback {
+  display: -webkit-inline-flex;
+  display: inline-flex;
+  -webkit-align-items: center;
+  align-items: center;
+  -webkit-justify-content: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: #334155;
+  color: #f1f5f9;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+.mle-lottery-outer-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 0;
+  flex: 1 1 auto;
+  color: #f1f5f9;
+}
+.mle-lottery-outer-badge {
+  font-size: 0.75rem;
+  background: #334155;
+  color: #94a3b8;
+  border-radius: 20px;
+  padding: 0.15rem 0.6rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.mle-lottery-outer-toggle {
+  background: transparent;
+  border: 1px solid #475569;
+  color: #cbd5e1;
+  border-radius: 5px;
+  padding: 0.22rem 0.65rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.mle-lottery-outer-toggle:hover {
+  background: #334155;
+}
+.mle-lottery-outer-body {
+  transition: max-height 0.35s ease-out, opacity 0.25s ease-out;
+  overflow: hidden;
+  max-height: 60000px;
+  opacity: 1;
+}
+.mle-lottery-outer.body-collapsed .mle-lottery-outer-body {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+}
+/* Remove bottom margin from last lottery-group inside an outer wrapper */
+.mle-lottery-outer-body .lottery-group:last-child {
+  margin-bottom: 0;
+}
+/* Indent inner draw cards slightly */
+.mle-lottery-outer-body .lottery-group.card {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.mle-lottery-outer-body .lottery-group.card:not(:first-child) {
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  margin-top: 0.5rem;
+}
 .lottery-group.collapsed .lotto-logo,
 .lottery-group.collapsed .lotto-logo.fallback {
   height: 48px;
@@ -11009,9 +11111,79 @@ foreach ($groups as $__g2) {
     }
 }
 unset($__g2, $__g2Lid);
+
+// ── Build per-lottery grouped list (outer container by lottery, draws sorted newest first) ──
+$__byLottery = array();           // lottery_id => ['lottery_id','lottery_name','groups'=>[...]]
+$__lotteryOrder = array();        // preserve first-seen lottery ordering
+foreach ($groups as $__gKey => $__gVal) {
+    $__lid = (int)$__gVal['lottery_id'];
+    if (!isset($__byLottery[$__lid])) {
+        $__byLottery[$__lid] = array(
+            'lottery_id'   => $__lid,
+            'lottery_name' => (string)$__gVal['lottery_name'],
+            'groups'       => array(),
+        );
+        $__lotteryOrder[] = $__lid;
+    }
+    $__byLottery[$__lid]['groups'][$__gKey] = $__gVal;
+}
+// Within each lottery, sort draws newest-first
+foreach ($__byLottery as &$__lotRef) {
+    uasort($__lotRef['groups'], function ($a, $b) {
+        return strcmp((string)($b['draw_date'] ?? ''), (string)($a['draw_date'] ?? ''));
+    });
+}
+unset($__lotRef);
 ?>
 
-<?php foreach ($groups as $g):
+<?php foreach ($__lotteryOrder as $__outerLid):
+  $__outerLot  = $__byLottery[$__outerLid];
+  $__outerMeta = $lottoMetaById[$__outerLid] ?? [];
+  $__outerState   = $__outerMeta['state']   ?? '';
+  $__outerCountry = $__outerMeta['country'] ?? '';
+  $__outerDrawCount = count($__outerLot['groups']);
+  $__outerLogo = buildLotteryLogoPath((string)$__outerState, (string)$__outerLot['lottery_name']);
+  $__outerStorageKey = 'mle_outer_collapsed_' . $__outerLid;
+?>
+<div class="mle-lottery-outer" data-outer-lottery-id="<?php echo $__outerLid; ?>">
+  <div class="mle-lottery-outer-header" role="button" tabindex="0"
+       aria-expanded="true" aria-label="Toggle <?php echo htmlspecialchars((string)$__outerLot['lottery_name'], ENT_QUOTES); ?> predictions"
+       data-outer-lottery-toggle="<?php echo $__outerLid; ?>">
+    <?php if (!empty($__outerLogo['path'])): ?>
+      <?php if ($__outerLogo['exists']): ?>
+        <img class="mle-lottery-outer-logo"
+             src="<?php echo htmlspecialchars($__outerLogo['path'], ENT_QUOTES); ?>"
+             alt="<?php echo htmlspecialchars($__outerLogo['alt'], ENT_QUOTES); ?>"
+             loading="lazy">
+      <?php else: ?>
+        <?php
+          $__ini = '';
+          foreach (preg_split('/\s+/', (string)$__outerLot['lottery_name']) as $__p) {
+              if ($__p !== '') { $__ini .= mb_strtoupper(mb_substr($__p,0,1)); if (mb_strlen($__ini) >= 2) break; }
+          }
+        ?>
+        <span class="mle-lottery-outer-logo-fallback" aria-hidden="true"><?php echo htmlspecialchars($__ini ?: 'LE', ENT_QUOTES); ?></span>
+      <?php endif; ?>
+    <?php endif; ?>
+    <h2 class="mle-lottery-outer-title">
+      <?php if ($__outerCountry) echo htmlspecialchars($__outerCountry, ENT_QUOTES); ?>
+      <?php if ($__outerState && $__outerState !== 'Lottery'): ?>
+        &nbsp;&bull;&nbsp;<?php echo htmlspecialchars($__outerState, ENT_QUOTES); ?>
+      <?php endif; ?>
+      <?php if (!empty($__outerLot['lottery_name'])): ?>
+        &nbsp;&bull;&nbsp;<?php echo htmlspecialchars((string)$__outerLot['lottery_name'], ENT_QUOTES); ?>
+      <?php endif; ?>
+    </h2>
+    <span class="mle-lottery-outer-badge"><?php echo $__outerDrawCount; ?> drawing<?php echo $__outerDrawCount !== 1 ? 's' : ''; ?></span>
+    <button type="button" class="mle-lottery-outer-toggle"
+            data-outer-lottery-toggle-btn="<?php echo $__outerLid; ?>"
+            aria-label="Collapse <?php echo htmlspecialchars((string)$__outerLot['lottery_name'], ENT_QUOTES); ?>">
+      &#x25BC; Collapse
+    </button>
+  </div>
+  <div class="mle-lottery-outer-body">
+
+<?php foreach ($__outerLot['groups'] as $g):
   $lottoUrl = $lottoUrlsById[$g['lottery_id']] ?? null;
   $meta     = $lottoMetaById[$g['lottery_id']] ?? [];
   $state    = $meta['state'] ?? '';
@@ -14513,7 +14685,11 @@ if (!empty($settingLabels)) {
 
     </div>  <!-- end .lottery-collapsible-content -->
     </div>  <!-- end .lottery-group -->
-  <?php endforeach; ?>
+  <?php endforeach; /* inner draw loop */ ?>
+
+  </div>  <!-- end .mle-lottery-outer-body -->
+</div>  <!-- end .mle-lottery-outer -->
+<?php endforeach; /* outer lottery loop */ ?>
 
 <?php endif; ?>
 </div>  <!-- end .prediction-panel -->
@@ -16836,6 +17012,45 @@ function convertTimestampsToLocal() {
 // Run timestamp conversion after DOM is ready
 convertTimestampsToLocal();
 
+// ============================================================
+// Outer lottery group collapse (mle-lottery-outer)
+// Persists state per lottery in localStorage.
+// ============================================================
+function mleOuterLotteryToggle(outerEl) {
+  if (!outerEl) return;
+  var lid = outerEl.getAttribute('data-outer-lottery-id') || '';
+  var storageKey = lid ? ('mle_outer_collapsed_' + lid) : '';
+  var btn = outerEl.querySelector('.mle-lottery-outer-toggle');
+  var isCollapsed = outerEl.classList.contains('body-collapsed');
+  if (isCollapsed) {
+    outerEl.classList.remove('body-collapsed');
+    if (btn) { btn.textContent = '\u25bc Collapse'; }
+    outerEl.setAttribute('aria-expanded', 'true');
+    if (storageKey) { try { localStorage.setItem(storageKey, 'false'); } catch(e) {} }
+  } else {
+    outerEl.classList.add('body-collapsed');
+    if (btn) { btn.textContent = '\u25b6 Expand'; }
+    outerEl.setAttribute('aria-expanded', 'false');
+    if (storageKey) { try { localStorage.setItem(storageKey, 'true'); } catch(e) {} }
+  }
+}
+
+function initOuterLotteryCollapse() {
+  Array.prototype.forEach.call(document.querySelectorAll('.mle-lottery-outer'), function(outerEl) {
+    var lid = outerEl.getAttribute('data-outer-lottery-id') || '';
+    var storageKey = lid ? ('mle_outer_collapsed_' + lid) : '';
+    try {
+      if (storageKey && localStorage.getItem(storageKey) === 'true') {
+        outerEl.classList.add('body-collapsed');
+        var btn = outerEl.querySelector('.mle-lottery-outer-toggle');
+        if (btn) { btn.textContent = '\u25b6 Expand'; }
+      }
+    } catch (e) {}
+  });
+}
+
+initOuterLotteryCollapse();
+
 // Lottery section collapse/expand: restore initial state from localStorage.
 // Click handling is done by data-lottery-toggle-btn="1" on the button.
 function initLotteryCollapse() {
@@ -17293,15 +17508,22 @@ function skaiLotteryToggle(btn) {
 }
 
 // ============================================================
-// skaiLotteryToggleAll: Collapse / expand ALL lottery-group sections.
+// skaiLotteryToggleAll: Collapse / expand ALL lottery-group sections
+// AND all outer mle-lottery-outer wrappers.
 // Updates each group's localStorage key and syncs per-group toggle buttons.
 // ES5-compatible; no dependencies.
 // ============================================================
 function skaiLotteryToggleAll(btn) {
   var groups = document.querySelectorAll('.lottery-group');
+  var outers = document.querySelectorAll('.mle-lottery-outer');
   var shouldCollapse = false;
   for (var i = 0; i < groups.length; i++) {
     if (!groups[i].classList.contains('collapsed')) { shouldCollapse = true; break; }
+  }
+  if (!shouldCollapse) {
+    for (var oi = 0; oi < outers.length; oi++) {
+      if (!outers[oi].classList.contains('body-collapsed')) { shouldCollapse = true; break; }
+    }
   }
   for (var j = 0; j < groups.length; j++) {
     var group      = groups[j];
@@ -17325,6 +17547,22 @@ function skaiLotteryToggleAll(btn) {
         toggle.setAttribute('aria-label', 'Collapse lottery section');
       }
       if (storageKey) { try { localStorage.setItem(storageKey, 'false'); } catch(e) {} }
+    }
+  }
+  // Also toggle outer lottery wrappers
+  for (var ok = 0; ok < outers.length; ok++) {
+    var outerEl   = outers[ok];
+    var outerLid  = outerEl.getAttribute('data-outer-lottery-id') || '';
+    var outerKey  = outerLid ? ('mle_outer_collapsed_' + outerLid) : '';
+    var outerBtn  = outerEl.querySelector('.mle-lottery-outer-toggle');
+    if (shouldCollapse) {
+      outerEl.classList.add('body-collapsed');
+      if (outerBtn) { outerBtn.textContent = '\u25b6 Expand'; }
+      if (outerKey) { try { localStorage.setItem(outerKey, 'true'); } catch(e) {} }
+    } else {
+      outerEl.classList.remove('body-collapsed');
+      if (outerBtn) { outerBtn.textContent = '\u25bc Collapse'; }
+      if (outerKey) { try { localStorage.setItem(outerKey, 'false'); } catch(e) {} }
     }
   }
   if (btn) {
@@ -18474,6 +18712,7 @@ if (typeof window !== 'undefined') {
   window.mlePrintHistoricalLottery = mlePrintHistoricalLottery;
   window.skaiLotteryToggle = skaiLotteryToggle;
   window.skaiLotteryToggleAll = skaiLotteryToggleAll;
+  window.mleOuterLotteryToggle = mleOuterLotteryToggle;
   window.mlePrintCard = mlePrintCard;
   window.mlePrintGroup = mlePrintGroup;
 }
@@ -18557,6 +18796,27 @@ document.addEventListener('click', function(evt) {
     }
     if (node.getAttribute && node.getAttribute('data-lottery-toggle-btn') === '1') {
       skaiLotteryToggle(node);
+      return;
+    }
+    // Outer lottery-group toggle (new two-level grouping)
+    if (node.getAttribute && node.getAttribute('data-outer-lottery-toggle-btn') !== null) {
+      var outerEl = node.closest ? node.closest('.mle-lottery-outer') : (function() {
+        var el = node;
+        while (el && !(el.classList && el.classList.contains('mle-lottery-outer'))) { el = el.parentElement; }
+        return el;
+      }());
+      if (outerEl) { mleOuterLotteryToggle(outerEl); }
+      if (evt.stopPropagation) { evt.stopPropagation(); } else { evt.cancelBubble = true; }
+      return;
+    }
+    // Click on the outer header itself (anywhere except the inner button)
+    if (node.getAttribute && node.getAttribute('data-outer-lottery-toggle') !== null) {
+      var outerEl2 = node.closest ? node.closest('.mle-lottery-outer') : (function() {
+        var el = node;
+        while (el && !(el.classList && el.classList.contains('mle-lottery-outer'))) { el = el.parentElement; }
+        return el;
+      }());
+      if (outerEl2) { mleOuterLotteryToggle(outerEl2); }
       return;
     }
     if (node.getAttribute && node.getAttribute('data-print-group-btn') === '1') {
