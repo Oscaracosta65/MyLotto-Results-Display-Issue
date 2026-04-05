@@ -2412,25 +2412,53 @@ if ($doGroupDelete && ($predictionTargetIdPost !== '' || ($lotteryId && $drawDat
         $drawDate   = $drawDateTs !== false ? date('Y-m-d', $drawDateTs) : '';
     }
 
+    // [FIX-DELETE-COLS] $__snCols is defined much later in this file (at the page-render phase).
+    // Fetch column names locally here so the delete handler knows which optional columns exist,
+    // regardless of where in the page lifecycle this POST fires.
+    $__delSnCols = array();
+    try {
+        $__delSnColsRaw = $db->getTableColumns('#__user_saved_numbers', false);
+        $__delSnCols = is_array($__delSnColsRaw) ? array_keys($__delSnColsRaw) : array();
+    } catch (\Throwable $__delE) { $__delSnCols = array(); }
+
     $q = $db->getQuery(true)
         ->delete($db->quoteName('#__user_saved_numbers'))
         ->where($db->quoteName('user_id') . ' = ' . (int) $user->id);
 
-    if ($predictionTargetIdPost !== '') {
+    // [FIX-DELETE-LEGACY] When prediction_target_id is available (new rows), use it directly.
+    // Older rows may have the column present but empty because they were saved before the
+    // target-identity system was introduced. To delete both old and new rows reliably we
+    // combine: (prediction_target_id = X  OR  (lottery_id = Y AND date = Z)).
+    // The OR ensures legacy rows without a populated prediction_target_id are also removed.
+    $hasPtidCol = in_array('prediction_target_id', $__delSnCols, true);
+    if ($predictionTargetIdPost !== '' && $hasPtidCol && $lotteryId && $drawDate !== '') {
+        // Build the date-part of the OR fallback
+        if (in_array('target_draw_date', $__delSnCols, true)) {
+            $__dateCond = 'DATE(COALESCE(' . $db->quoteName('target_draw_date') . ',' . $db->quoteName('next_draw_date') . ')) = ' . $db->quote($drawDate);
+        } else {
+            $__dateCond = 'DATE(' . $db->quoteName('next_draw_date') . ') = ' . $db->quote($drawDate);
+        }
+        $q->where(
+            '(' .
+            $db->quoteName('prediction_target_id') . ' = ' . $db->quote($predictionTargetIdPost) .
+            ' OR (' . $db->quoteName('lottery_id') . ' = ' . $lotteryId . ' AND ' . $__dateCond . ')' .
+            ')'
+        );
+    } elseif ($predictionTargetIdPost !== '' && $hasPtidCol) {
         $q->where($db->quoteName('prediction_target_id') . ' = ' . $db->quote($predictionTargetIdPost));
     } else {
         $q->where($db->quoteName('lottery_id') . ' = ' . $lotteryId);
         if ($drawDate !== '') {
-            if (in_array('target_draw_date', $__snCols, true)) {
+            if (in_array('target_draw_date', $__delSnCols, true)) {
                 $q->where('DATE(COALESCE(' . $db->quoteName('target_draw_date') . ', ' . $db->quoteName('next_draw_date') . ')) = ' . $db->quote($drawDate));
             } else {
                 $q->where('DATE(' . $db->quoteName('next_draw_date') . ') = ' . $db->quote($drawDate));
             }
         }
-        if ($targetDrawSessionPost !== '' && in_array('target_draw_session', $__snCols, true)) {
+        if ($targetDrawSessionPost !== '' && in_array('target_draw_session', $__delSnCols, true)) {
             $q->where('LOWER(TRIM(COALESCE(' . $db->quoteName('target_draw_session') . ', ' . $db->quoteName('draw_session') . '))) = ' . $db->quote($targetDrawSessionPost));
         }
-        if ($targetDrawAtPost !== '' && in_array('target_draw_at', $__snCols, true)) {
+        if ($targetDrawAtPost !== '' && in_array('target_draw_at', $__delSnCols, true)) {
             $q->where('COALESCE(' . $db->quoteName('target_draw_at') . ', ' . $db->quoteName('next_draw_at') . ') = ' . $db->quote($targetDrawAtPost));
         }
     }
