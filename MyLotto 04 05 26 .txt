@@ -455,10 +455,19 @@ function mylottoexpertResolvePredictionTargetMeta($row)
     $targetGameId = trim((string)(mylottoexpertResolveRowValue($row, 'target_game_id') ?? mylottoexpertResolveRowValue($row, 'game_id') ?? ''));
     $targetLotteryId = (int)(mylottoexpertResolveRowValue($row, 'target_lottery_id') ?? mylottoexpertResolveRowValue($row, 'lottery_id') ?? 0);
     $targetDrawDate = trim((string)(mylottoexpertResolveRowValue($row, 'target_draw_date') ?? mylottoexpertResolveRowValue($row, 'next_draw_date') ?? ''));
+    // [FIX-LEGACY-DATE] Joomla null-date sentinel ('0000-00-00*') is not a real draw date;
+    // clear it so the value is treated as absent rather than propagated as an invalid string.
+    if ($targetDrawDate !== '' && strncmp($targetDrawDate, '0000-00-00', 10) === 0) {
+        $targetDrawDate = '';
+    }
     if ($targetDrawDate !== '') {
         $ts = strtotime($targetDrawDate);
-        if ($ts !== false) {
+        if ($ts !== false && $ts > 0) {
             $targetDrawDate = date('Y-m-d', $ts);
+        } else {
+            // [FIX-LEGACY-DATE] Unparseable or pre-epoch date → treat as absent so downstream
+            // draw lookups receive an empty string rather than a garbage date.
+            $targetDrawDate = '';
         }
     }
     $targetDrawAt = trim((string)(mylottoexpertResolveRowValue($row, 'target_draw_at') ?? mylottoexpertResolveRowValue($row, 'next_draw_at') ?? ''));
@@ -8101,6 +8110,28 @@ function mylottoexpertExtractDrawNumbersFromRow($gameId, $row)
         }
     }
 
+    // [FIX-LEGACY-DRAW-RESULTS] Backward-compatible fallback for regular lotteries whose
+    // lottery_skip_config.json entry is missing main_ball_columns. In that case every path
+    // above leaves result['main'] empty. Parse the draw_results column (format:
+    // 'N-N-N-N-N' or 'N-N-N-N-N+E') as a dash-separated ball list so that older saved
+    // predictions for such games still resolve to a real draw and score correctly.
+    // Daily games are protected: their draw_results is a plain digit string ('502', etc.)
+    // which does NOT match the /^\d+(?:-\d+){2,}$/ pattern and is therefore skipped.
+    if (empty($result['main']) && array_key_exists('draw_results', $row) && $row['draw_results'] !== '' && $row['draw_results'] !== null) {
+        // Strip optional '+E' extra-ball suffix before matching.
+        $__drStripped = preg_replace('/\+.*$/', '', (string)$row['draw_results']);
+        // Require at least 3 dash-separated parts (e.g. 'N-N-N') to distinguish a regular
+        // lottery ball list from a plain digit string used by daily games ('502', '1234', etc.)
+        if (preg_match('/^\d+(?:-\d+){2,}$/', trim($__drStripped))) {
+            foreach (explode('-', trim($__drStripped)) as $__drPart) {
+                $__drNum = (int)$__drPart;
+                if ($__drNum > 0) {
+                    $result['main'][] = $__drNum;
+                }
+            }
+        }
+    }
+
     return $result;
 }
 
@@ -8894,7 +8925,12 @@ foreach ($savedSets as $s) {
     $__targetMeta = mylottoexpertResolvePredictionTargetMeta($s);
     $__groupKey   = mylottoexpertBuildGroupIdentity($__targetMeta);
     $__groupGameId = $__targetMeta['target_game_id'] !== '' ? $__targetMeta['target_game_id'] : (string)$s->game_id;
-    $__groupDrawDate = $__targetMeta['target_draw_date'] !== '' ? $__targetMeta['target_draw_date'] : (string)$s->next_draw_date;
+    // [FIX-LEGACY-DATE] Sanitize the next_draw_date fallback: Joomla stores NULL dates as
+    // '0000-00-00 00:00:00'. Passing that through to getDrawByDate causes strtotime() to
+    // return false, silently producing no draw match even for predictions that had a real draw.
+    $__nextDateRaw = trim((string)$s->next_draw_date);
+    if (strncmp($__nextDateRaw, '0000-00-00', 10) === 0) { $__nextDateRaw = ''; }
+    $__groupDrawDate = $__targetMeta['target_draw_date'] !== '' ? $__targetMeta['target_draw_date'] : $__nextDateRaw;
 
     if (!isset($groups[$__groupKey])) {
         $groups[$__groupKey] = array(
