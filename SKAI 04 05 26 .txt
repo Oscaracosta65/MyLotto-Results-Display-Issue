@@ -9188,8 +9188,13 @@ $labelInput = implode(' - ', $parts);
                 goto SKAI_SAVE_DONE;
             }
         } else {
-            // No extra ball in config ? drop extras silently
-            if (!$hasExtraCfg || $extraMax <= 0) {
+            // [FIX-EXTRAS-DROP] Drop extras only for non-SKAI, non-daily saves on games that
+            // truly have no extra ball.  Do NOT drop for SKAI pool saves ($isSkaiPool=true):
+            // $lotteryConfig is always [] at save time so $hasExtraCfg/$extraMax are always
+            // 0/false, but the posted extras are valid (Powerball top-5 Powerballs, Euromillions
+            // Lucky Stars).  Do NOT drop for daily games: extras are bonus digits, not config
+            // extra balls.  Without this guard, every SKAI AI save silently loses all extras.
+            if (!$isSkaiPool && !$isDailyGamePosted && (!$hasExtraCfg || $extraMax <= 0)) {
                 $extraArr = [];
             }
         }
@@ -50014,11 +50019,17 @@ document.addEventListener('DOMContentLoaded', function () {
     // 2. Build numbers_json payload
     var _njPayload = { main_numbers: _mainNums, extra_numbers: _extraNums };
     if (_bfIsDaily && r.dailyChosenCombos && r.dailyChosenCombos.length) {
-      _njPayload.main_numbers             = _dailyStrings.slice();
-      _njPayload.extra_ball_numbers       = [];
-      _njPayload.daily_top_combo_strings  = _dailyStrings.slice();
+      var _bfBonusDigits = (r.dailyExtraDigits && r.dailyExtraDigits.length) ? r.dailyExtraDigits.slice(0, 3) : [];
+      _njPayload.main_numbers               = _dailyStrings.slice();
+      // [FIX-BATCH-BONUS] Also place bonus digits in extra_numbers so PHP reads them
+      // into $extraArr via $nums['extra_numbers'].  Previously they were only in
+      // daily_bonus_digits (a key PHP never reads for $extraArr), so $extraArr was []
+      // and daily_bonus_digits_json was never saved.
+      _njPayload.extra_numbers              = _bfBonusDigits.slice();
+      _njPayload.extra_ball_numbers         = _bfBonusDigits.slice();
+      _njPayload.daily_top_combo_strings    = _dailyStrings.slice();
       _njPayload.daily_primary_combo_digits = _mainNums.slice();
-      _njPayload.daily_bonus_digits = (r.dailyExtraDigits && r.dailyExtraDigits.length) ? r.dailyExtraDigits.slice(0, 3) : [];
+      _njPayload.daily_bonus_digits         = _bfBonusDigits.slice();
     }
     var _numbersJsonStr = '';
     try { _numbersJsonStr = JSON.stringify(_njPayload); } catch(_) {}
@@ -50057,6 +50068,18 @@ document.addEventListener('DOMContentLoaded', function () {
       _payload['main_numbers']     = JSON.stringify(_dailyStrings.slice());
       _payload['main_numbers_csv'] = _dailyStrings.join(',');
       try { _payload['daily_top_combos_json'] = JSON.stringify(r.dailyChosenCombos); } catch(_) {}
+      // [FIX-BATCH-BONUS] Ensure bonus digits reach PHP $extraArr via extra_ball_numbers
+      if (_bfBonusDigits && _bfBonusDigits.length) {
+        _payload['extra_ball_numbers']     = JSON.stringify(_bfBonusDigits.slice());
+        _payload['extra_ball_numbers_csv'] = _bfBonusDigits.join(',');
+      }
+    }
+    // [FIX-BATCH-DAILY-META] Explicitly set pick_length and allow_zero for daily batch saves
+    // so PHP can detect the game type even when form field was cleared between runs.
+    if (_bfIsDaily) {
+      var _bfPickLen = parseInt((window.SKAI_META && (window.SKAI_META.pick || window.SKAI_META.pickSize)) || 0, 10) || 0;
+      if (_bfPickLen > 0) { _payload['pick_length'] = String(_bfPickLen); }
+      _payload['allow_zero'] = '1';
     }
     // Per-run settings
     _payload['risk_profile']               = _profVal;
