@@ -17012,29 +17012,6 @@ function convertTimestampsToLocal() {
 // Run timestamp conversion after DOM is ready
 convertTimestampsToLocal();
 
-// ============================================================
-// Outer lottery group collapse (mle-lottery-outer)
-// Persists state per lottery in localStorage.
-// ============================================================
-function mleOuterLotteryToggle(outerEl) {
-  if (!outerEl) return;
-  var lid = outerEl.getAttribute('data-outer-lottery-id') || '';
-  var storageKey = lid ? ('mle_outer_collapsed_' + lid) : '';
-  var btn = outerEl.querySelector('.mle-lottery-outer-toggle');
-  var isCollapsed = outerEl.classList.contains('body-collapsed');
-  if (isCollapsed) {
-    outerEl.classList.remove('body-collapsed');
-    if (btn) { btn.textContent = '\u25bc Collapse'; }
-    outerEl.setAttribute('aria-expanded', 'true');
-    if (storageKey) { try { localStorage.setItem(storageKey, 'false'); } catch(e) {} }
-  } else {
-    outerEl.classList.add('body-collapsed');
-    if (btn) { btn.textContent = '\u25b6 Expand'; }
-    outerEl.setAttribute('aria-expanded', 'false');
-    if (storageKey) { try { localStorage.setItem(storageKey, 'true'); } catch(e) {} }
-  }
-}
-
 function initOuterLotteryCollapse() {
   Array.prototype.forEach.call(document.querySelectorAll('.mle-lottery-outer'), function(outerEl) {
     var lid = outerEl.getAttribute('data-outer-lottery-id') || '';
@@ -17335,6 +17312,29 @@ initLotteryCollapse();
 });
 
 /* ===== merged script section ===== */
+
+// ============================================================
+// Outer lottery group collapse (mle-lottery-outer)
+// Persists state per lottery in localStorage.
+// ============================================================
+function mleOuterLotteryToggle(outerEl) {
+  if (!outerEl) return;
+  var lid = outerEl.getAttribute('data-outer-lottery-id') || '';
+  var storageKey = lid ? ('mle_outer_collapsed_' + lid) : '';
+  var btn = outerEl.querySelector('.mle-lottery-outer-toggle');
+  var isCollapsed = outerEl.classList.contains('body-collapsed');
+  if (isCollapsed) {
+    outerEl.classList.remove('body-collapsed');
+    if (btn) { btn.textContent = '\u25bc Collapse'; }
+    outerEl.setAttribute('aria-expanded', 'true');
+    if (storageKey) { try { localStorage.setItem(storageKey, 'false'); } catch(e) {} }
+  } else {
+    outerEl.classList.add('body-collapsed');
+    if (btn) { btn.textContent = '\u25b6 Expand'; }
+    outerEl.setAttribute('aria-expanded', 'false');
+    if (storageKey) { try { localStorage.setItem(storageKey, 'true'); } catch(e) {} }
+  }
+}
 
   function scrollToFavorites() {
     var el = document.getElementById('favorite-lotteries');
