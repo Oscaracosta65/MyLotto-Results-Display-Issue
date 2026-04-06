@@ -11039,6 +11039,11 @@ foreach ($bestOpps as $__sopp) {
      Saved Predictions & Numbers Section $unionSql
 ================================================== -->
 
+<div class="mle-section-label" style="margin:1.5rem 0 1rem; padding:0 0.25rem;">
+  <h2 style="font-size:1.1rem; font-weight:800; color:#1e293b; margin:0 0 0.35rem;">Your Saved Predictions</h2>
+  <p style="font-size:0.9rem; color:#475569; margin:0; line-height:1.55;">Each card shows a full set of numbers saved for an upcoming or completed draw. Select methods to compare overlap, review hit rates, and identify which configurations performed best against real draw results.</p>
+</div>
+
 <!-- Legend will appear after first prediction group via JavaScript -->
 <div id="legend-card-placeholder" class="skai-card legend-card" style="display:none; margin:1rem 0;">
   <div class="skai-card__header">
@@ -13078,6 +13083,10 @@ $methodKeys = ['skip_hit','ai_prediction','mcmc_prediction','skai_prediction','h
 
   <!-- PERFORMANCE TAB -->
   <div class="sdi-panel" data-sdi-panel="performance" role="tabpanel" style="display:none;">
+  <div style="padding:1rem 1rem 0.5rem; border-bottom:1px solid #e2e8f0; margin-bottom:0.75rem;">
+    <h3 style="font-size:1rem; font-weight:800; color:#1e293b; margin:0 0 0.3rem;">Historical Evaluation</h3>
+    <p style="font-size:0.875rem; color:#475569; margin:0; line-height:1.5;">Review how each prediction method ranked actual winning numbers across past draws. Use the placement heatmap and hit-rate data to identify which methods perform most consistently for this lottery.</p>
+  </div>
 
 <div class="card decision-strip" data-decision-strip style="display:none;">
   <div class="decision-strip-header">
@@ -14677,9 +14686,9 @@ if (!empty($settingLabels)) {
 
   <!-- SETTINGS TAB -->
   <div class="sdi-panel" data-sdi-panel="settings" role="tabpanel" style="display:none;">
-    <div style="padding:1.25rem 1rem; font-size:0.9rem; color:#6b7280;">
-      Open individual method cards in the <strong>Methods</strong> tab
-      and click <strong>Details</strong> on any card to access its settings.
+    <div style="padding:1.25rem 1rem 0.5rem;">
+      <h3 style="font-size:1rem; font-weight:800; color:#1e293b; margin:0 0 0.35rem;">Saved Run Details</h3>
+      <p style="font-size:0.875rem; color:#475569; margin:0; line-height:1.5;">Access the exact configuration used in each saved prediction run. Open the <strong>Method Comparison</strong> tab and click <strong>Details</strong> on any card to review the parameters, training style, and settings saved with that run.</p>
     </div>
   </div>
 
