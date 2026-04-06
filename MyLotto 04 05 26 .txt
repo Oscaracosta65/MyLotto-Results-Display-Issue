@@ -8765,8 +8765,11 @@ function buildLotteryLogoPath(string $stateName, string $gameName): array
     $abbrLower = strtolower($abbrUpper);          // e.g., az
 
     // Your exact spec: str_replace(' ','-', strtolower($gName))
-    // Strip path-traversal sequences and any characters outside [a-z0-9 .-] before building slug.
-    $gameName  = preg_replace('/\.\.|\/|\\\\/', '', $gameName); // remove .. / \ traversal chars
+    // Sanitize $gameName before slug building using an allowlist approach to prevent path traversal.
+    // URL-decode first to catch encoded traversal sequences (%2e%2e, %2f, etc.), then strip to
+    // safe characters only. This preserves all valid lottery name characters for slug generation.
+    $gameName  = urldecode((string)$gameName);
+    $gameName  = preg_replace('/[^A-Za-z0-9 \'\-\&\(\)\.]/', '', $gameName);
     $slugExact = str_replace(' ', '-', strtolower($gameName));
 
     // A safer fallback slug (strip punctuation, compress dashes)
