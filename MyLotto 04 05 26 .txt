@@ -7813,6 +7813,8 @@ function mylottoexpertLoadLotterySpec($gameId)
     $result = array();
 
     $masterPath = JPATH_ROOT . '/lottery_skip_config.json';
+    $__masterCfg  = null;
+    $__masterSpec = null;
     if (is_file($masterPath)) {
         $raw = json_decode(file_get_contents($masterPath), true);
         if (json_last_error() === JSON_ERROR_NONE && !empty($raw['lotteries'][$gameId]) && is_array($raw['lotteries'][$gameId])) {
@@ -7821,13 +7823,23 @@ function mylottoexpertLoadLotterySpec($gameId)
             if (!isset($cfg['is_daily'])) {
                 $cfg['is_daily'] = false;
             }
-            $result = array(
-                'dbCol'         => (string)($spec['dbCol'] ?? ''),
-                'lotteryConfig' => $cfg,
-                'raw'           => $spec,
-            );
-            $__mleSpecCache[$gameId] = $result;
-            return $result;
+            $__masterDbCol = (string)($spec['dbCol'] ?? '');
+            if ($__masterDbCol !== '') {
+                // [MASTER-PATH] dbCol found in master config: return immediately.
+                $result = array(
+                    'dbCol'         => $__masterDbCol,
+                    'lotteryConfig' => $cfg,
+                    'raw'           => $spec,
+                );
+                $__mleSpecCache[$gameId] = $result;
+                return $result;
+            }
+            // [FIX-DBCOL-FALLTHROUGH] dbCol is absent from the master config entry but the
+            // game IS registered there. Fall through to dailylotteries.json so tableName can
+            // be used as the dbCol fallback. Save the master lotteryConfig so its column
+            // mappings (main_ball_columns etc.) can be merged with the daily row below.
+            $__masterCfg  = $cfg;
+            $__masterSpec = $spec;
         }
     }
 
@@ -7892,7 +7904,7 @@ function mylottoexpertLoadLotterySpec($gameId)
 
     foreach (array(
         'pick_size'             => array('pick_size', 'pickSize', 'daily_pick_size', 'num_main_balls_drawn', 'mainNumbersDrawn'),
-        'num_extra_balls_drawn' => array('num_extra_balls_drawn', 'numExtraBallsDrawn', 'extra_ball_count', 'extraCount'),
+        'num_extra_balls_drawn' => array('num_extra_balls_drawn', 'numExtraBallsDrawn', 'extra_ball_count', 'extraCount', 'extraBallCount'),
         'main_ball_columns'     => array('main_ball_columns', 'mainBallColumns'),
         'extra_ball_columns'    => array('extra_ball_columns', 'extraBallColumns'),
         'extra_ball_column'     => array('extra_ball_column', 'extraBallColumn'),
@@ -7918,10 +7930,35 @@ function mylottoexpertLoadLotterySpec($gameId)
         $dailyCfg['is_daily'] = true;
     }
 
+    // [FIX-MAIN-BALL-COLUMNS] dailylotteries.json entries only carry pickSize, not
+    // main_ball_columns. Without column names the UNION ALL query emits NULL for every
+    // main ball and the draw is never resolved. Auto-derive the ordered column list from
+    // pickSize using the ordinal column names that the results table always has
+    // (first, second, third, fourth, fifth). This runs only when main_ball_columns has
+    // not been set explicitly by either the daily row or the master config.
+    if (empty($dailyCfg['main_ball_columns'])) {
+        $__ps = (int)($dailyCfg['pick_size'] ?? 0);
+        if ($__ps > 0) {
+            $__ordinals = array('first','second','third','fourth','fifth','sixth','seventh','eighth','ninth','tenth');
+            $dailyCfg['main_ball_columns'] = array_slice($__ordinals, 0, min($__ps, count($__ordinals)));
+        }
+    }
+
+    // [FIX-DBCOL-FALLTHROUGH] When the master config had this game but no dbCol, merge its
+    // lotteryConfig on top of the daily one so explicit column mappings, ball counts, and
+    // other settings from the master entry are preserved alongside the daily tableName.
+    if (is_array($__masterCfg)) {
+        foreach ($__masterCfg as $__mk => $__mv) {
+            if ($__mv !== null && $__mv !== '' && $__mv !== array()) {
+                $dailyCfg[$__mk] = $__mv;
+            }
+        }
+    }
+
     $result = array(
         'dbCol'         => (string)($dailyRow['dbCol'] ?? $dailyRow['tableName'] ?? $dailyRow['table_name'] ?? $dailyRow['table'] ?? ''),
         'lotteryConfig' => $dailyCfg,
-        'raw'           => $dailyRow,
+        'raw'           => is_array($__masterSpec) ? array_merge((array)$dailyRow, $__masterSpec) : $dailyRow,
     );
 
     $__mleSpecCache[$gameId] = $result;
