@@ -7856,9 +7856,24 @@ function mylottoexpertLoadLotterySpec($gameId)
             $dailyRow = $__pool[$gameId];
             break;
         }
-        foreach ($__pool as $__row) {
+        // [FIX-SKY-DAILY-LOOKUP] dailylotteries.json may store Sky Daily entries with lowercase
+        // keys (e.g. "ny_pick3_mid") while the canonical game_id is always uppercase
+        // ("NY_PICK3_MID"). SKAI's skaiDailyLoadByGameId (skai_daily_bridge.php) resolves this
+        // via case-insensitive lookup, but the uppercase-only direct key check above misses them.
+        // Add a lowercase direct key fallback so the entry is found without a full-pool scan.
+        $__lcKey = strtolower($gameId);
+        if ($__lcKey !== $gameId && !empty($__pool[$__lcKey]) && is_array($__pool[$__lcKey])) {
+            $dailyRow = $__pool[$__lcKey];
+            break;
+        }
+        // Inner loop: if neither uppercase nor lowercase direct key matched, scan every entry.
+        // [FIX-SKY-DAILY-LOOKUP] Also use the JSON key ($__iterKey) as a last-resort game_id
+        // when the row has no explicit "game_id"/"gameId"/"gid" field. Sky Daily entries in
+        // dailylotteries.json use the JSON key itself as the identifier without a separate
+        // "game_id" property, so without this fallback the entry is silently skipped.
+        foreach ($__pool as $__iterKey => $__row) {
             if (!is_array($__row)) { continue; }
-            $__rowGameId = strtoupper(trim((string)($__row['game_id'] ?? $__row['gameId'] ?? $__row['gid'] ?? '')));
+            $__rowGameId = strtoupper(trim((string)($__row['game_id'] ?? $__row['gameId'] ?? $__row['gid'] ?? $__iterKey ?? '')));
             if ($__rowGameId === $gameId) {
                 $dailyRow = $__row;
                 break 2;
@@ -9703,7 +9718,9 @@ foreach ($groups as $__gKey => $__g) {
     $__gTargetAt     = trim((string)($__g['target_draw_at'] ?? ''));
     $__gTargetSession= mylottoexpertNormalizeTargetSession($__g['target_draw_session'] ?? '');
     $__fbCacheKey    = $__g['game_id'] . '|' . $__gDateNorm . '|' . ($__gTargetAt !== '' ? $__gTargetAt : 'no-time') . '|' . ($__gTargetSession !== '' ? $__gTargetSession : 'no-session');
-    $__drawMapLegacyKey = $__g['game_id'] . '|' . $__gDateNorm;
+    // [FIX-SKY-DAILY-LOOKUP] drawMap keys are always lowercase (see strtolower() when building
+    // the map). Lowercasing here ensures the legacy lookup matches for any game_id case.
+    $__drawMapLegacyKey = strtolower((string)($__g['game_id'] ?? '')) . '|' . $__gDateNorm;
     $__preferCanonicalDrawLookup = ($__gTargetAt !== '' || $__gTargetSession !== '');
 
     // ── Fetch draw for this canonical target (cached per game+date+time/session) ──
