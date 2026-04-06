@@ -29810,6 +29810,121 @@ function hardResetSelections(){
 </script>
 
 <script>
+/* ===================================================================
+ * MLE RECALL SETTINGS BOOTSTRAP
+ * Reads the 'mle_recall_settings' payload stored in sessionStorage by
+ * the MyLotto "Use These Settings" button and applies the saved config
+ * to the SKAI UI controls (profile/strategy chips, blend slider, and
+ * advanced parameters). Runs once on DOMContentLoaded, then clears the
+ * sessionStorage entry so it does not re-apply on subsequent page loads.
+ * =================================================================== */
+;(function(){
+  'use strict';
+  if (window.__MLE_RECALL_APPLIED__) { return; }
+  window.__MLE_RECALL_APPLIED__ = true;
+
+  // Only activate when the navigation was triggered by a recall button
+  if (window.location.search.indexOf('mle_recall=1') === -1) { return; }
+
+  function applyRecall() {
+    var raw;
+    try { raw = sessionStorage.getItem('mle_recall_settings'); } catch (_) { return; }
+    if (!raw) { return; }
+    var payload;
+    try { payload = JSON.parse(raw); } catch (_) { return; }
+    // Clear immediately so a manual page refresh doesn't re-apply
+    try { sessionStorage.removeItem('mle_recall_settings'); } catch (_) {}
+
+    var p = payload.params || {};
+
+    // 1. Profile chip (balanced / explorative / conservative)
+    var profile = String(p.profile || p.training_style || p.risk_profile || '').toLowerCase();
+    var strategy = String(p.strategy || p.blend || '').toLowerCase() || 'hybrid';
+    if (profile && typeof window.skaiApplyCombo === 'function') {
+      try { window.skaiApplyCombo(profile, strategy); } catch (_) {}
+    } else if (profile) {
+      var profBtn = document.querySelector('#skai-profile-buttons .btn-chip[data-profile="' + profile + '"]');
+      if (profBtn) { profBtn.click(); }
+      if (strategy) {
+        var stratBtn = document.querySelector('#skai-strategy-buttons .btn-chip[data-strategy="' + strategy + '"]');
+        if (stratBtn) { stratBtn.click(); }
+      }
+    }
+
+    // 2. Blend slider (AI %)
+    var aiPct = null;
+    if (p.skai_blend_ai_pct  !== undefined) { aiPct = Number(p.skai_blend_ai_pct); }
+    else if (p.blend_ai_pct  !== undefined) { aiPct = Number(p.blend_ai_pct); }
+    else if (p.ai_pct        !== undefined) { aiPct = Number(p.ai_pct); }
+    if (aiPct !== null && isFinite(aiPct)) {
+      if (aiPct <= 1) { aiPct = Math.round(aiPct * 100); }
+      aiPct = Math.max(0, Math.min(100, Math.round(aiPct)));
+      var blendSlider = document.getElementById('skai-blend-range');
+      if (blendSlider) {
+        blendSlider.value = String(aiPct);
+        blendSlider.dispatchEvent(new Event('input',  { bubbles: true }));
+        blendSlider.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    // 3. Advanced settings sliders/inputs
+    var advMap = {
+      epochs              : 'epochs',
+      batch_size          : 'batch',
+      dropout_rate        : 'dropout',
+      learning_rate       : 'lr',
+      recency_decay       : 'decay',
+      skai_window_size    : 'window',
+      hidden_layers       : 'layers',
+      sampling_temperature: 'temp',
+      diversity_penalty   : 'diversity',
+      gap_scale           : 'gap'
+    };
+    function setAdv(base, val) {
+      var v = String(val);
+      var sld = document.getElementById('skaiadv_' + base);
+      var num = document.getElementById('skaiadv_' + base + '_num');
+      if (sld) { sld.value = v; sld.dispatchEvent(new Event('input',  { bubbles: true })); sld.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (num) { num.value = v; num.dispatchEvent(new Event('input',  { bubbles: true })); num.dispatchEvent(new Event('change', { bubbles: true })); }
+    }
+    for (var key in advMap) {
+      if (Object.prototype.hasOwnProperty.call(advMap, key) && p[key] !== undefined && p[key] !== '') {
+        setAdv(advMap[key], p[key]);
+      }
+    }
+
+    // 4. Activation function select
+    if (p.activation_function !== undefined && p.activation_function !== '') {
+      var actSel = document.getElementById('skaiadv_activation');
+      if (actSel) {
+        actSel.value = String(p.activation_function);
+        actSel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    // Notify the page that settings were applied from an external recall
+    try {
+      window.dispatchEvent(new CustomEvent('skai:settings:applied', {
+        detail: { source: 'mle_recall', lotteryId: payload.lotteryId, settingId: payload.settingId },
+        bubbles: true
+      }));
+    } catch (_) {}
+
+    if (window.console) {
+      console.info('[MLE Recall] Settings applied from saved configuration #' + payload.settingId);
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', applyRecall, { once: true });
+  } else {
+    // Small delay so skaiApplyCombo / chip wiring have a chance to complete
+    setTimeout(applyRecall, 150);
+  }
+})();
+</script>
+
+<script>
 ;(function(){
   'use strict';
 
