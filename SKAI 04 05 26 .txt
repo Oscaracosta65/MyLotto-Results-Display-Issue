@@ -381,6 +381,10 @@ $userGroups = $currUser->groups ?? [];
 $gameIdRaw = $in->getString('game_id', '');
 if ($gameIdRaw === '') { $gameIdRaw = $in->getString('gameId', ''); }
 if ($gameIdRaw === '') { $gameIdRaw = $in->getString('gid', ''); }
+// Sanitize game_id at input boundary: allow only alphanumeric, hyphen, underscore, and dot.
+// This preserves all valid identifiers (e.g. 'FL3', '801', 'AZ2', 'euro-millions') while
+// rejecting any character that could contribute to injection in SQL, HTML, JS, or URL contexts.
+$gameIdRaw = preg_replace('/[^a-zA-Z0-9\-_\.]/', '', substr((string)$gameIdRaw, 0, 50));
 $gameId = $gameIdRaw; // string; do NOT cast to int here
 
 

@@ -2291,7 +2291,9 @@ $showNewFeatures = mylottoexpertGetUserPref($db, (int) $user->id, 'showNewFeatur
 // Allow POST toggle via form
 if ($app->input->getMethod() === 'POST' && $app->input->post->get('toggle_new_features', '', 'STRING') !== '') {
     if (!\Joomla\CMS\Session\Session::checkToken('post')) {
-        die('Invalid Token');
+        $app->enqueueMessage('Your session has expired. Please refresh and try again.', 'error');
+        $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
+        exit;
     }
     $newVal = $app->input->post->get('new_features_enabled', '0', 'STRING') === '1' ? '1' : '0';
     mylottoexpertSetUserPref($db, (int) $user->id, 'showNewFeatures', $newVal);
@@ -2306,7 +2308,9 @@ $predSortDir  = (strtolower($predSortPref) === 'asc') ? 'ASC' : 'DESC';
 // Allow POST change via form
 if ($app->input->getMethod() === 'POST' && $app->input->post->get('change_sort_dir', '', 'STRING') !== '') {
     if (!\Joomla\CMS\Session\Session::checkToken('post')) {
-        die('Invalid Token');
+        $app->enqueueMessage('Your session has expired. Please refresh and try again.', 'error');
+        $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
+        exit;
     }
     $dir = strtolower($app->input->post->get('pred_sort_dir', 'desc', 'STRING'));
     $dir = ($dir === 'asc') ? 'asc' : 'desc';
@@ -2357,7 +2361,8 @@ if ($app->input->getMethod() === 'POST') {
             $app->enqueueMessage('Prediction deleted.', 'message');
             $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
         } catch (Exception $e) {
-            $app->enqueueMessage('Error deleting: ' . $e->getMessage(), 'error');
+            error_log('[MLE] Error deleting prediction id=' . $id . ': ' . $e->getMessage());
+            $app->enqueueMessage('An error occurred while deleting. Please try again.', 'error');
         }
     }
     // Delete multiple predictions via PRC table checkboxes (comma-separated IDs)
@@ -2377,7 +2382,8 @@ if ($app->input->getMethod() === 'POST') {
                 $app->enqueueMessage($count . ' prediction' . ($count !== 1 ? 's' : '') . ' deleted.', 'message');
                 $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
             } catch (Exception $e) {
-                $app->enqueueMessage('Error deleting: ' . $e->getMessage(), 'error');
+                error_log('[MLE] Error deleting multiple predictions: ' . $e->getMessage());
+                $app->enqueueMessage('An error occurred while deleting. Please try again.', 'error');
             }
         }
     }
@@ -2395,7 +2401,8 @@ if ($app->input->getMethod() === 'POST') {
             $app->enqueueMessage('All predictions deleted.', 'message');
             $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
         } catch (Exception $e) {
-            $app->enqueueMessage('Error deleting all: ' . $e->getMessage(), 'error');
+            error_log('[MLE] Error deleting all predictions for user=' . (int)$user->id . ': ' . $e->getMessage());
+            $app->enqueueMessage('An error occurred while deleting. Please try again.', 'error');
         }
     }
 
@@ -2469,7 +2476,8 @@ if ($doGroupDelete && ($predictionTargetIdPost !== '' || ($lotteryId && $drawDat
         $app->enqueueMessage('Deleted all predictions for this draw.', 'message');
         $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
     } catch (Exception $e) {
-        $app->enqueueMessage('Error deleting group: ' . $e->getMessage(), 'error');
+        error_log('[MLE] Error deleting prediction group for user=' . (int)$user->id . ': ' . $e->getMessage());
+        $app->enqueueMessage('An error occurred while deleting. Please try again.', 'error');
     }
 }
 
@@ -2495,7 +2503,8 @@ if ($__noteId > 0) {
     try {
         $db->execute();
     } catch (Exception $__ne) {
-        $app->enqueueMessage('Failed to save note: ' . $__ne->getMessage(), 'error');
+        error_log('[MLE] Failed to save note for setting id=' . $__noteId . ': ' . $__ne->getMessage());
+        $app->enqueueMessage('An error occurred while saving the note. Please try again.', 'error');
     }
     $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
     exit;
@@ -2518,7 +2527,8 @@ if ($id > 0) {
             $app->enqueueMessage('Saved setting deleted.', 'message');
             $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
         } catch (Exception $e) {
-            $app->enqueueMessage('Error deleting saved setting: ' . $e->getMessage(), 'error');
+            error_log('[MLE] Error deleting saved setting id=' . $id . ': ' . $e->getMessage());
+            $app->enqueueMessage('An error occurred while deleting the saved setting. Please try again.', 'error');
         }
     }
 
@@ -2604,7 +2614,8 @@ if ($id > 0) {
                 $db->execute();
                 $app->enqueueMessage('Settings saved.', 'message');
             } catch (Exception $e) {
-                $app->enqueueMessage('Failed to save: ' . $e->getMessage(), 'error');
+                error_log('[MLE] Failed to save settings template for user=' . (int)$user->id . ': ' . $e->getMessage());
+                $app->enqueueMessage('An error occurred while saving. Please try again.', 'error');
             }
         }
         // [[FIX]] Always redirect after save (Post-Redirect-Get) to prevent double-submit
@@ -2767,7 +2778,8 @@ if ($id > 0) {
                 $db->execute();
                 $app->enqueueMessage('Strategy saved to Saved Numbers.', 'message');
             } catch (Exception $e) {
-                $app->enqueueMessage('Error saving strategy: ' . $e->getMessage(), 'error');
+                error_log('[MLE] Error saving strategy for user=' . (int)$user->id . ': ' . $e->getMessage());
+                $app->enqueueMessage('An error occurred while saving the strategy. Please try again.', 'error');
             }
         } else {
             $app->enqueueMessage('Please add at least one number before saving.', 'warning');
@@ -8753,6 +8765,8 @@ function buildLotteryLogoPath(string $stateName, string $gameName): array
     $abbrLower = strtolower($abbrUpper);          // e.g., az
 
     // Your exact spec: str_replace(' ','-', strtolower($gName))
+    // Strip path-traversal sequences and any characters outside [a-z0-9 .-] before building slug.
+    $gameName  = preg_replace('/\.\.|\/|\\\\/', '', $gameName); // remove .. / \ traversal chars
     $slugExact = str_replace(' ', '-', strtolower($gameName));
 
     // A safer fallback slug (strip punctuation, compress dashes)
