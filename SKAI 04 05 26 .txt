@@ -18553,13 +18553,23 @@ $escDrawDate = htmlspecialchars($formattedDrawDate, ENT_QUOTES, 'UTF-8');
         <div style="font-size:0.75rem;color:#94a3b8;margin-top:1px;">Saved <?php echo $__tplDate; ?></div>
         <?php endif; ?>
       </div>
-      <button type="button"
-              class="btn-outline"
-              style="flex-shrink:0;font-size:0.8rem;padding:5px 12px;white-space:nowrap;"
-              onclick="if(typeof skaiApplySavedTemplate==='function'){skaiApplySavedTemplate(<?php echo $__tplParamsJson; ?>);}return false;"
-              aria-label="Load settings: <?php echo $__tplName; ?>">
-        Load
-      </button>
+      <!-- [[SKAI_LOAD_AND_RUN_BUTTONS]] Primary action: load settings then immediately run SKAI. -->
+      <!-- Secondary action: load settings only so user can review/adjust before running.       -->
+      <div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0;">
+        <button type="button"
+                style="font-size:0.8rem;padding:5px 14px;white-space:nowrap;background:#1C66FF;color:#fff;border:1px solid #1553d4;border-radius:6px;cursor:pointer;font-weight:700;"
+                onclick="if(typeof skaiLoadAndRun==='function'){skaiLoadAndRun(<?php echo $__tplParamsJson; ?>);}return false;"
+                aria-label="Load settings and run SKAI: <?php echo $__tplName; ?>">
+          Load and Run
+        </button>
+        <button type="button"
+                class="btn-outline"
+                style="font-size:0.75rem;padding:3px 10px;white-space:nowrap;"
+                onclick="if(typeof skaiApplySavedTemplate==='function'){skaiApplySavedTemplate(<?php echo $__tplParamsJson; ?>);}return false;"
+                aria-label="Load settings only: <?php echo $__tplName; ?>">
+          Load Only
+        </button>
+      </div>
     </div>
     <?php endforeach; ?>
   </div>
@@ -29223,6 +29233,82 @@ strat = strat || 'N/A';
         }, 5000);
       } catch (_) {}
     }
+  };
+
+  // [[SKAI_LOAD_AND_RUN]]
+  // Complete Load -> Apply -> Run workflow for saved SKAI configuration templates.
+  // Called by the "Load and Run" buttons in the Saved SKAI Settings panel.
+  //
+  // Steps:
+  //   1. Apply all saved values into SKAI controls (delegates to skaiApplySavedTemplate).
+  //   2. Update feedback element to indicate a run is starting.
+  //   3. After a short settle delay, programmatically click startPrediction.
+  //
+  // Safety guards:
+  //   - Does nothing if params is not an object.
+  //   - Does not click if the run button is absent or access-locked.
+  //   - Falls back gracefully with a message in each error path.
+  window.skaiLoadAndRun = function skaiLoadAndRun(params) {
+    if (!params || typeof params !== 'object') { return; }
+
+    // Step 1: Apply all saved settings to SKAI controls.
+    if (typeof window.skaiApplySavedTemplate === 'function') {
+      window.skaiApplySavedTemplate(params);
+    }
+
+    // Step 2: Update the feedback element - override the "click Run" message with
+    //         an "about to run" message so the user knows automation is in progress.
+    var fb = document.getElementById('skai-saved-template-feedback');
+    if (fb) {
+      try { clearTimeout(fb._hideTimer); } catch (_) {}
+      fb.style.display = 'block';
+      fb.style.color   = '#065f46';
+      fb.textContent   = 'Settings loaded. Starting SKAI run...';
+    }
+
+    // Step 3: Trigger the run button after 150 ms so all slider/input change events
+    //         from skaiApplySavedTemplate have had time to propagate to backend state.
+    setTimeout(function () {
+      var runBtn = document.getElementById('startPrediction') ||
+                   document.getElementById('runPrediction');
+
+      if (!runBtn) {
+        if (fb) {
+          fb.style.color = '#92400e';
+          fb.textContent = 'Settings loaded. Run button not found -- please click Generate Numbers manually.';
+        }
+        return;
+      }
+
+      // Do not click if the button is access-locked (non-subscriber).
+      if (runBtn.getAttribute('data-skai-locked-run') === '1' || runBtn.disabled) {
+        if (fb) {
+          fb.style.color = '#92400e';
+          fb.textContent = 'Settings loaded. Unlock SKAI to run predictions.';
+        }
+        return;
+      }
+
+      try {
+        if (typeof runBtn.click === 'function') {
+          runBtn.click();
+        } else {
+          var ev;
+          try {
+            ev = new MouseEvent('click', { bubbles: true, cancelable: true });
+          } catch (_) {
+            ev = document.createEvent('MouseEvents');
+            ev.initEvent('click', true, true);
+          }
+          runBtn.dispatchEvent(ev);
+        }
+      } catch (_) {
+        if (fb) {
+          fb.style.color = '#92400e';
+          fb.textContent = 'Settings loaded. Please click Generate Numbers to run.';
+        }
+      }
+    }, 150);
   };
 
   function applyProfile(p){
