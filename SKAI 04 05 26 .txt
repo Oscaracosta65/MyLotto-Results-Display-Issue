@@ -381,6 +381,10 @@ $userGroups = $currUser->groups ?? [];
 $gameIdRaw = $in->getString('game_id', '');
 if ($gameIdRaw === '') { $gameIdRaw = $in->getString('gameId', ''); }
 if ($gameIdRaw === '') { $gameIdRaw = $in->getString('gid', ''); }
+// Sanitize game_id at input boundary: allow only alphanumeric, hyphen, underscore, and dot.
+// This preserves all valid identifiers (e.g. 'FL3', '801', 'AZ2', 'euro-millions') while
+// rejecting any character that could contribute to injection in SQL, HTML, JS, or URL contexts.
+$gameIdRaw = preg_replace('/[^a-zA-Z0-9\-_\.]/', '', substr((string)$gameIdRaw, 0, 50));
 $gameId = $gameIdRaw; // string; do NOT cast to int here
 
 
@@ -8731,7 +8735,10 @@ try {
             $isDailyGamePosted = true;
         } elseif ($cfgPick >= 2 && $cfgPick <= 5 && $cfgMainMax > 0 && $cfgMainMax <= 9 && !$cfgHasExtra) {
             $isDailyGamePosted = true;
-        } elseif ($pickLengthPosted >= 2 && $pickLengthPosted <= 5 && !$cfgHasExtra && $cfgMainMax > 0 && $cfgMainMax <= 9) {
+        } elseif ($pickLengthPosted >= 2 && $pickLengthPosted <= 5 && !$cfgHasExtra) {
+            // pick_length is only set by skaiPrepareAiSave for digit (daily) games (maxMain <= 9).
+            // Do NOT require $cfgMainMax > 0 here: $lotteryConfig is always empty [] at save time
+            // because the config-loading block runs AFTER this save handler in the page order.
             $isDailyGamePosted = true;
         }
 
@@ -8962,7 +8969,55 @@ $labelInput = implode(' - ', $parts);
             }
         }
 
-        $dailyDisplayMain = '';
+        // [FIX-EVIDENCE-RECOVERY] Last-resort recovery from top_combos_json evidence.
+        // wireEvidence (document capture phase) always populates top_combos_json before
+        // interceptSaveForm serialises the form; so $evidenceDecoded is the most reliable
+        // source when numbers_json / main_numbers fields are empty (which happens because
+        // interceptSaveForm's stopPropagation() prevents skaiPrepareAiSave from running).
+        if (empty($mainArr) && is_array($evidenceDecoded)) {
+            // Step 1: detect daily game from evidence payload
+            if (!$isDailyGamePosted) {
+                if (!empty($evidenceDecoded['is_daily_game'])
+                    || !empty($evidenceDecoded['daily_chosen_combos'])) {
+                    $isDailyGamePosted = true;
+                    skai_debug_log('[SKAI SAVE TRACE] isDailyGamePosted_recovered_from_evidence=1');
+                }
+            }
+            // Step 2: extract main numbers and pre-populate $nums['daily_top_combo_strings']
+            // so the $dailyDisplaySet builder below can use the existing code path.
+            if ($isDailyGamePosted && !empty($evidenceDecoded['daily_chosen_combos']) && is_array($evidenceDecoded['daily_chosen_combos'])) {
+                $__recoveredDisplays = [];
+                foreach ($evidenceDecoded['daily_chosen_combos'] as $__dccRow) {
+                    if (!is_array($__dccRow)) { continue; }
+                    $__dccDisp = '';
+                    if (!empty($__dccRow['display'])) {
+                        $__dccDisp = preg_replace('/[^0-9]/', '', (string)$__dccRow['display']);
+                    } elseif (!empty($__dccRow['combo']) && is_array($__dccRow['combo'])) {
+                        $__dccDisp = implode('', array_map('intval', $__dccRow['combo']));
+                    } elseif (!empty($__dccRow['values'])) {
+                        $__dccDisp = preg_replace('/[^0-9]/', '', (string)$__dccRow['values']);
+                    }
+                    if ($__dccDisp !== '') { $__recoveredDisplays[] = $__dccDisp; }
+                    if (count($__recoveredDisplays) >= 5) { break; }
+                }
+                if (!empty($__recoveredDisplays)) {
+                    // Inject into $nums so the standard $dailyDisplaySet builder uses it
+                    if (!is_array($nums)) { $nums = []; }
+                    $nums['daily_top_combo_strings'] = $__recoveredDisplays;
+                    // Set $mainArr from first combo digits for downstream range checks
+                    $mainArr = array_map('intval', str_split((string)$__recoveredDisplays[0]));
+                    skai_debug_log('[SKAI SAVE TRACE] main_numbers_recovered_from_evidence=1 display=' . (string)$__recoveredDisplays[0]);
+                }
+            } elseif (!$isDailyGamePosted && !empty($evidenceDecoded['final_prediction_sets']) && is_array($evidenceDecoded['final_prediction_sets'])) {
+                $__fps0 = $evidenceDecoded['final_prediction_sets'][0] ?? [];
+                if (!empty($__fps0['values']) && is_array($__fps0['values'])) {
+                    $mainArr = array_map('intval', $__fps0['values']);
+                    skai_debug_log('[SKAI SAVE TRACE] main_numbers_recovered_from_fps_evidence=1');
+                }
+            }
+        }
+
+
         $dailyDisplaySet = [];
         if ($isDailyGamePosted) {
             if (!empty($nums['daily_top_combo_strings']) && is_array($nums['daily_top_combo_strings'])) {
@@ -8991,11 +9046,29 @@ $labelInput = implode(' - ', $parts);
                 }
             }
             if (empty($dailyDisplaySet) && !empty($mainArr) && is_array($mainArr)) {
-                foreach ($mainArr as $__dailyMainRow) {
-                    if (is_array($__dailyMainRow) || is_object($__dailyMainRow)) { continue; }
-                    $__dailyMainDisp = preg_replace('/[^0-9]/', '', (string)$__dailyMainRow);
-                    if ($__dailyMainDisp !== '') { $dailyDisplaySet[] = $__dailyMainDisp; }
-                    if (count($dailyDisplaySet) >= 5) { break; }
+                // [FIX-SKAI-COMBO-JOIN] Detect whether mainArr contains individual digit values
+                // (e.g. [5, 0, 2] from an AI output that returned per-digit arrays) rather than
+                // full combo strings (e.g. ['502', '183']). When all elements are single digits
+                // (0-9), join them into one combo string so daily_top_picks_json is stored as
+                // ['502'] not ['5','0','2']. The latter causes MyLottoExpert to compare single-digit
+                // combos against multi-digit draw strings and report 0 hits for a correct prediction.
+                $__skaiAllSingleDigits = true;
+                foreach ($mainArr as $__smItem) {
+                    if (is_array($__smItem) || is_object($__smItem)) { $__skaiAllSingleDigits = false; break; }
+                    $__smStr = preg_replace('/[^0-9]/', '', (string)$__smItem);
+                    if (strlen($__smStr) !== 1) { $__skaiAllSingleDigits = false; break; }
+                }
+                if ($__skaiAllSingleDigits && count($mainArr) >= 2) {
+                    // Individual digit values: join as one combo string
+                    $__skaiJoined = implode('', array_map(function($d) { return (string)(int)$d; }, $mainArr));
+                    if ($__skaiJoined !== '') { $dailyDisplaySet[] = $__skaiJoined; }
+                } else {
+                    foreach ($mainArr as $__dailyMainRow) {
+                        if (is_array($__dailyMainRow) || is_object($__dailyMainRow)) { continue; }
+                        $__dailyMainDisp = preg_replace('/[^0-9]/', '', (string)$__dailyMainRow);
+                        if ($__dailyMainDisp !== '') { $dailyDisplaySet[] = $__dailyMainDisp; }
+                        if (count($dailyDisplaySet) >= 5) { break; }
+                    }
                 }
             }
             if ($dailyDisplayMain === '' && !empty($dailyDisplaySet)) {
@@ -9119,8 +9192,13 @@ $labelInput = implode(' - ', $parts);
                 goto SKAI_SAVE_DONE;
             }
         } else {
-            // No extra ball in config ? drop extras silently
-            if (!$hasExtraCfg || $extraMax <= 0) {
+            // [FIX-EXTRAS-DROP] Drop extras only for non-SKAI, non-daily saves on games that
+            // truly have no extra ball.  Do NOT drop for SKAI pool saves ($isSkaiPool=true):
+            // $lotteryConfig is always [] at save time so $hasExtraCfg/$extraMax are always
+            // 0/false, but the posted extras are valid (Powerball top-5 Powerballs, Euromillions
+            // Lucky Stars).  Do NOT drop for daily games: extras are bonus digits, not config
+            // extra balls.  Without this guard, every SKAI AI save silently loses all extras.
+            if (!$isSkaiPool && !$isDailyGamePosted && (!$hasExtraCfg || $extraMax <= 0)) {
                 $extraArr = [];
             }
         }
@@ -13696,7 +13774,86 @@ $lotteryId              = isset($lotteryId) ? (int)$lotteryId : 0;
 // If $saveable was explicitly set earlier, keep it; otherwise, mirror the access flag.
 $saveable               = isset($saveable) ? (bool)$saveable : $userIsInAllowedGroup;
 
-$bestWindowN            = $bestWindowN ?? null;
+// [[SKAI_SAVED_TEMPLATES]] Load compatible My Lotto Expert saved settings for this user + lottery.
+// Only skai_prediction records are compatible with SKAI controls.
+// Sorted newest first; capped at 10 to keep the panel compact.
+$skaiSavedTemplates = [];
+// [[SKAI_SAVED_TEMPLATES_USER]] $currUser is the page-level authenticated user (assigned at [ACCESS]).
+// $user is only assigned inside XHR/save handler blocks and must NOT be used here.
+if (!isset($currUser)) { $currUser = Factory::getUser(); }
+if ((int)($currUser->id ?? 0) > 0 && (int)$lotteryId > 0) {
+    try {
+        $__sstQ = $db->getQuery(true)
+            ->select(['id', 'setting_name', 'params', 'created_at'])
+            ->from($db->quoteName('#__user_saved_settings'))
+            ->where($db->quoteName('user_id')    . ' = ' . (int)$currUser->id)
+            ->where($db->quoteName('lottery_id') . ' = ' . (int)$lotteryId)
+            ->where($db->quoteName('source')     . ' = ' . $db->quote('skai_prediction'))
+            ->order($db->quoteName('created_at') . ' DESC')
+            ->setLimit(10);
+        $db->setQuery($__sstQ);
+        $__sstRows = $db->loadAssocList() ?: [];
+        foreach ($__sstRows as $__sstRow) {
+            // Decode params; skip records with no usable data.
+            $__sstParams = json_decode((string)($__sstRow['params'] ?? ''), true);
+            if (!is_array($__sstParams) || empty($__sstParams)) { continue; }
+            // Validate setting_name; skip blank records.
+            $__sstName = trim((string)($__sstRow['setting_name'] ?? ''));
+            if ($__sstName === '') { continue; }
+            // Sanitize the params we will embed as JSON for the JS apply function.
+            // Whitelist only the fields that SKAI controls understand.
+            $__sstAllowedKeys = [
+                'profile', 'training_style', 'strategy', 'blend',
+                'skai_blend_ai_pct', 'skai_blend_skip_pct', 'blend_ai_pct', 'blend_skip_pct',
+                'ai_pct', 'skip_pct',
+                'epochs', 'batch_size', 'dropout_rate', 'learning_rate',
+                'activation_function', 'hidden_layers', 'recency_decay',
+                'skai_window_size', 'sampling_temperature', 'diversity_penalty',
+                'gap_scale', 'laplace_k', 'skai_run_mode',
+                'skai_top_n_numbers', 'skai_top_n_combos',
+            ];
+            $__sstSafe = [];
+            foreach ($__sstAllowedKeys as $__sstKey) {
+                if (isset($__sstParams[$__sstKey]) && $__sstParams[$__sstKey] !== '') {
+                    // Only scalar values; discard arrays/objects.
+                    if (is_scalar($__sstParams[$__sstKey])) {
+                        $__sstSafe[$__sstKey] = $__sstParams[$__sstKey];
+                    }
+                }
+            }
+            if (empty($__sstSafe)) { continue; }
+            // Build summary line for display.
+            $__sstProfile  = (string)($__sstSafe['profile'] ?? $__sstSafe['training_style'] ?? '');
+            $__sstStrategy = (string)($__sstSafe['strategy'] ?? '');
+            $__sstBlend    = null;
+            foreach (['skai_blend_ai_pct','blend_ai_pct','ai_pct'] as $__bk) {
+                if (isset($__sstSafe[$__bk]) && is_numeric($__sstSafe[$__bk])) {
+                    $__sstBlend = (int)round((float)$__sstSafe[$__bk]); break;
+                }
+            }
+            $__sstEpochs   = isset($__sstSafe['epochs']) && is_numeric($__sstSafe['epochs'])
+                             ? (int)$__sstSafe['epochs'] : null;
+            $__sstDate     = '';
+            $__sstTs       = strtotime((string)($__sstRow['created_at'] ?? ''));
+            if ($__sstTs) { $__sstDate = date('M j, Y', $__sstTs); }
+            $skaiSavedTemplates[] = [
+                'id'       => (int)$__sstRow['id'],
+                'name'     => $__sstName,
+                'profile'  => $__sstProfile,
+                'strategy' => $__sstStrategy,
+                'blend'    => $__sstBlend,
+                'epochs'   => $__sstEpochs,
+                'date'     => $__sstDate,
+                'params'   => $__sstSafe,
+            ];
+        }
+    } catch (Exception $__sstEx) {
+        // Non-fatal: panel simply shows empty state if query fails.
+        $skaiSavedTemplates = [];
+    }
+}
+
+$bestWindowN= $bestWindowN ?? null;
 $focusBest              = $focusBest   ?? null;
 $cvFocus                = $cvFocus     ?? [];
 
@@ -18355,6 +18512,100 @@ $escDrawDate = htmlspecialchars($formattedDrawDate, ENT_QUOTES, 'UTF-8');
   </div>
 <?php endif; ?>
 </div>
+
+<?php if ($skaiUiVisible && !empty($skaiSavedTemplates)): ?>
+<!-- [[SKAI_SAVED_TEMPLATES_PANEL]] Reuse a saved My Lotto Expert SKAI setup -->
+<div id="skai-saved-templates-panel"
+     style="margin:0 0 14px 0;border:1px solid rgba(28,102,255,0.22);border-radius:14px;background:#f8fbff;overflow:hidden;">
+  <div style="padding:12px 16px 10px 16px;border-bottom:1px solid rgba(28,102,255,0.12);">
+    <div style="font-size:0.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#1C66FF;margin-bottom:4px;">
+      Saved SKAI Settings
+    </div>
+    <div style="font-size:0.92rem;font-weight:700;color:#0A1A33;margin-bottom:2px;">
+      Reuse a Previous SKAI Configuration
+    </div>
+    <p style="font-size:0.82rem;color:#475569;margin:0;line-height:1.5;">
+      These are your saved SKAI configurations from My Lotto Expert for this lottery.
+      Click <strong>Load</strong> to apply a saved setup to the controls below, then run SKAI using those exact settings.
+    </p>
+  </div>
+  <div style="padding:10px 14px 12px 14px;display:flex;flex-direction:column;gap:8px;">
+    <?php foreach ($skaiSavedTemplates as $__tpl): ?>
+    <?php
+      // [[SKAI_LOAD_AND_RUN_DATA_ATTR]]
+      // Store params in a data attribute rather than embedding JSON inline in onclick.
+      // JSON_HEX_QUOT converts " to \u0022 which is invalid as a JS object-literal key
+      // in inline event handlers, causing SyntaxError: missing ) after argument list.
+      // htmlspecialchars with ENT_QUOTES safely encodes " as &quot; for the HTML attribute;
+      // the browser restores it to " before passing the attribute value to JavaScript, so
+      // JSON.parse() inside the onclick receives well-formed JSON and works correctly.
+      $__tplParamsAttr = htmlspecialchars(
+          json_encode($__tpl['params'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_UNESCAPED_UNICODE),
+          ENT_QUOTES, 'UTF-8'
+      );
+      $__tplName     = htmlspecialchars($__tpl['name'],     ENT_QUOTES, 'UTF-8');
+      $__tplProfile  = htmlspecialchars(ucfirst((string)$__tpl['profile']),  ENT_QUOTES, 'UTF-8');
+      $__tplStrategy = htmlspecialchars((string)$__tpl['strategy'], ENT_QUOTES, 'UTF-8');
+      $__tplDate     = htmlspecialchars($__tpl['date'],     ENT_QUOTES, 'UTF-8');
+      $__tplBlend    = ($__tpl['blend'] !== null) ? (int)$__tpl['blend'] . '% AI' : '';
+      $__tplEpochs   = ($__tpl['epochs'] !== null) ? (int)$__tpl['epochs'] . ' epochs' : '';
+      $__tplMeta     = implode('  |  ', array_filter([$__tplProfile, $__tplStrategy, $__tplBlend, $__tplEpochs]));
+    ?>
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid rgba(28,102,255,0.14);border-radius:10px;background:#fff;">
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:0.88rem;font-weight:700;color:#0A1A33;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+             title="<?php echo $__tplName; ?>"><?php echo $__tplName; ?></div>
+        <?php if ($__tplMeta !== ''): ?>
+        <div style="font-size:0.78rem;color:#475569;margin-top:2px;"><?php echo $__tplMeta; ?></div>
+        <?php endif; ?>
+        <?php if ($__tplDate !== ''): ?>
+        <div style="font-size:0.75rem;color:#94a3b8;margin-top:1px;">Saved <?php echo $__tplDate; ?></div>
+        <?php endif; ?>
+      </div>
+      <!-- [[SKAI_LOAD_AND_RUN_BUTTONS]] Primary action: load settings then immediately run SKAI. -->
+      <!-- Secondary action: load settings only so user can review/adjust before running.       -->
+      <!-- params are stored in data-skai-params; onclick uses JSON.parse to avoid the           -->
+      <!-- \u0022 SyntaxError that occurs when JSON_HEX_QUOT output is embedded inline.          -->
+      <div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0;">
+        <button type="button"
+                data-skai-params="<?php echo $__tplParamsAttr; ?>"
+                style="font-size:0.8rem;padding:5px 14px;white-space:nowrap;background:#1C66FF;color:#fff;border:1px solid #1553d4;border-radius:6px;cursor:pointer;font-weight:700;"
+                onclick="var __sp;try{__sp=JSON.parse(this.getAttribute('data-skai-params'));}catch(__e){__sp=null;}if(__sp&&typeof skaiLoadAndRun==='function'){skaiLoadAndRun(__sp);}return false;"
+                aria-label="Load settings and run SKAI: <?php echo $__tplName; ?>">
+          Load and Run
+        </button>
+        <button type="button"
+                data-skai-params="<?php echo $__tplParamsAttr; ?>"
+                class="btn-outline"
+                style="font-size:0.75rem;padding:3px 10px;white-space:nowrap;"
+                onclick="var __sp;try{__sp=JSON.parse(this.getAttribute('data-skai-params'));}catch(__e){__sp=null;}if(__sp&&typeof skaiApplySavedTemplate==='function'){skaiApplySavedTemplate(__sp);}return false;"
+                aria-label="Load settings only: <?php echo $__tplName; ?>">
+          Load Only
+        </button>
+      </div>
+    </div>
+    <?php endforeach; ?>
+  </div>
+  <div id="skai-saved-template-feedback"
+       role="status" aria-live="polite"
+       style="display:none;padding:6px 16px 10px 16px;font-size:0.82rem;font-weight:600;color:#065f46;"></div>
+</div>
+<?php endif; ?>
+
+<?php if ($skaiUiVisible && empty($skaiSavedTemplates) && (int)$lotteryId > 0 && (int)($currUser->id ?? 0) > 0): ?>
+<!-- [[SKAI_SAVED_TEMPLATES_EMPTY]] No saved SKAI templates found for this lottery -->
+<div id="skai-saved-templates-empty"
+     style="margin:0 0 14px 0;padding:10px 14px;border:1px dashed rgba(28,102,255,0.2);border-radius:12px;background:#f8fbff;">
+  <div style="font-size:0.78rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#1C66FF;margin-bottom:3px;">
+    Saved SKAI Settings
+  </div>
+  <p style="font-size:0.82rem;color:#475569;margin:0;line-height:1.5;">
+    No saved SKAI configurations found for this lottery yet.
+    After you run SKAI and save a prediction, your settings will appear here so you can reload them for future runs.
+  </p>
+</div>
+<?php endif; ?>
+
 <!-- Ensure the options container is not inside a form; if it is, explicit button types prevent accidental submits -->
 <div id="skai-run-options" class="tile" aria-labelledby="skai-run-options-title" style="margin:10px 0 14px 0; display:none;">
 <h4 id="skai-run-options-title" style="margin:0 0 8px 0">
@@ -28797,6 +29048,282 @@ strat = strat || 'N/A';
     return { profile: prof, strategy: strat, blendText: blend.text };
   }
 
+  // [[SKAI_APPLY_SAVED_TEMPLATE]]
+  // Maps a saved My Lotto Expert SKAI settings record (params object from #__user_saved_settings)
+  // into the active SKAI controls.  Called by the "Load" buttons in the Saved SKAI Settings panel.
+  //
+  // Field mapping (MLE saved key -> SKAI control):
+  //   profile / training_style  -> applyProfile() + profile button active state
+  //   strategy                  -> setStrategy() + strategy button active state
+  //   skai_blend_ai_pct /
+  //     blend_ai_pct / ai_pct   -> setBlend() + blend slider
+  //   epochs                    -> skaiadv_epochs slider + hidden input
+  //   batch_size                -> skaiadv_batch slider + hidden input
+  //   dropout_rate              -> skaiadv_dropout slider + hidden input
+  //   learning_rate             -> skaiadv_lr slider + hidden input
+  //   hidden_layers             -> skaiadv_layers slider + hidden input
+  //   recency_decay             -> skaiadv_decay slider + hidden input
+  //   skai_window_size          -> skaiadv_window slider + hidden input
+  //   activation_function       -> skaiadv_activation select
+  //   sampling_temperature      -> skaiadv_temp slider
+  //   diversity_penalty         -> skaiadv_diversity slider
+  //   gap_scale                 -> skaiadv_gap slider
+  //   skai_run_mode             -> hidden input skai-ai-run-mode
+  //   skai_top_n_numbers        -> hidden input skai-ai-top-n-numbers
+  //   skai_top_n_combos         -> hidden input skai-ai-top-n-combos
+  //
+  // Missing or non-numeric fields are silently skipped; no existing state is corrupted.
+  window.skaiApplySavedTemplate = function skaiApplySavedTemplate(params) {
+    if (!params || typeof params !== 'object') { return; }
+
+    // -- Helpers ----------------------------------------------------------------
+
+    // Fire input + change so any live sync/display listeners react.
+    function fireEvents(el) {
+      if (!el) { return; }
+      try {
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch (_) {}
+    }
+
+    // Set a range slider + its companion number input, then fire events.
+    function setSlider(sliderId, numId, val) {
+      var slider = document.getElementById(sliderId);
+      var num    = document.getElementById(numId);
+      if (slider) { slider.value = String(val); fireEvents(slider); }
+      if (num)    { num.value    = String(val); fireEvents(num); }
+    }
+
+    // Set a plain hidden input value.
+    function setHidden(id, val) {
+      var el = document.getElementById(id);
+      if (el) { el.value = String(val); fireEvents(el); }
+    }
+
+    // Safely parse a numeric value; return null if not valid.
+    function num(v, min, max) {
+      var n = parseFloat(v);
+      if (!isFinite(n)) { return null; }
+      if (min !== undefined && n < min) { n = min; }
+      if (max !== undefined && n > max) { n = max; }
+      return n;
+    }
+
+    var applied = 0;
+
+    // -- Profile ---------------------------------------------------------------
+    var profile = String(params.profile || params.training_style || '').toLowerCase().trim();
+    if (profile && typeof applyProfile === 'function') {
+      // Normalize common aliases
+      if (profile === 'conservative') { profile = 'conservative'; }
+      else if (profile === 'explorative' || profile === 'aggressive') { profile = 'explorative'; }
+      else { profile = 'balanced'; }
+      try { applyProfile(profile); applied++; } catch (_) {}
+      // Also activate the matching profile button for visual consistency
+      try {
+        var profBtns = document.querySelectorAll('[data-profile]');
+        for (var pi = 0; pi < profBtns.length; pi++) {
+          var pb = profBtns[pi];
+          var isMatch = (pb.getAttribute('data-profile') === profile);
+          pb.classList.toggle('is-active', isMatch);
+          pb.setAttribute('aria-pressed', isMatch ? 'true' : 'false');
+        }
+      } catch (_) {}
+    }
+
+    // -- Strategy --------------------------------------------------------------
+    var strategy = String(params.strategy || '').toLowerCase().trim();
+    if (strategy && typeof setStrategy === 'function') {
+      // Normalize
+      if (strategy === 'ai' || strategy === 'ai-forward' || strategy === 'ai_forward') { strategy = 'ai'; }
+      else if (strategy === 'skip' || strategy === 'skip_pattern' || strategy === 'skip-pattern') { strategy = 'skip'; }
+      else { strategy = 'hybrid'; }
+      try { setStrategy(strategy); applied++; } catch (_) {}
+      // Activate matching strategy button
+      try {
+        var stratBtns = document.querySelectorAll('[data-strategy]');
+        for (var si = 0; si < stratBtns.length; si++) {
+          var sb = stratBtns[si];
+          var stratMatch = (sb.getAttribute('data-strategy') === strategy);
+          sb.classList.toggle('is-active', stratMatch);
+          sb.setAttribute('aria-pressed', stratMatch ? 'true' : 'false');
+        }
+      } catch (_) {}
+    }
+
+    // -- Blend -----------------------------------------------------------------
+    var blendRaw = params.skai_blend_ai_pct || params.blend_ai_pct || params.ai_pct || null;
+    var blendVal = num(blendRaw, 0, 100);
+    if (blendVal !== null && typeof setBlend === 'function') {
+      try { setBlend(Math.round(blendVal)); applied++; } catch (_) {}
+    }
+
+    // -- Advanced slider controls ----------------------------------------------
+    var epochsVal = num(params.epochs, 1, 500);
+    if (epochsVal !== null) {
+      setSlider('skaiadv_epochs', 'skaiadv_epochs_num', Math.round(epochsVal)); applied++;
+    }
+
+    var batchVal = num(params.batch_size, 1, 512);
+    if (batchVal !== null) {
+      setSlider('skaiadv_batch', 'skaiadv_batch_num', Math.round(batchVal)); applied++;
+    }
+
+    var dropoutVal = num(params.dropout_rate, 0, 0.6);
+    if (dropoutVal !== null) {
+      setSlider('skaiadv_dropout', 'skaiadv_dropout_num', dropoutVal); applied++;
+    }
+
+    var lrVal = num(params.learning_rate, 0.000001, 0.1);
+    if (lrVal !== null) {
+      setSlider('skaiadv_lr', 'skaiadv_lr_num', lrVal); applied++;
+    }
+
+    var layersVal = num(params.hidden_layers, 1, 12);
+    if (layersVal !== null) {
+      setSlider('skaiadv_layers', 'skaiadv_layers_num', Math.round(layersVal)); applied++;
+    }
+
+    var decayVal = num(params.recency_decay, 0, 0.999);
+    if (decayVal !== null) {
+      setSlider('skaiadv_decay', 'skaiadv_decay_num', decayVal); applied++;
+    }
+
+    var windowVal = num(params.skai_window_size, 5, 500);
+    if (windowVal !== null) {
+      setSlider('skaiadv_window', 'skaiadv_window_num', Math.round(windowVal)); applied++;
+    }
+
+    var tempVal = num(params.sampling_temperature, 0.5, 1.5);
+    if (tempVal !== null) {
+      setSlider('skaiadv_temp', 'skaiadv_temp_num', tempVal); applied++;
+    }
+
+    var divVal = num(params.diversity_penalty, 0, 0.1);
+    if (divVal !== null) {
+      setSlider('skaiadv_diversity', 'skaiadv_diversity_num', divVal); applied++;
+    }
+
+    var gapVal = num(params.gap_scale, 0, 1);
+    if (gapVal !== null) {
+      setSlider('skaiadv_gap', 'skaiadv_gap_num', gapVal); applied++;
+    }
+
+    // -- Activation function select --------------------------------------------
+    var actRaw = String(params.activation_function || '').toLowerCase().trim();
+    var validAct = { tanh: 1, relu: 1, elu: 1, sigmoid: 1 };
+    if (actRaw && validAct[actRaw]) {
+      var actSel = document.getElementById('skaiadv_activation');
+      if (actSel) { actSel.value = actRaw; fireEvents(actSel); applied++; }
+    }
+
+    // -- Hidden inputs ---------------------------------------------------------
+    if (params.skai_run_mode) {
+      setHidden('skai-ai-run-mode', params.skai_run_mode); applied++;
+    }
+    var topN = num(params.skai_top_n_numbers, 1, 100);
+    if (topN !== null) {
+      setHidden('skai-ai-top-n-numbers', Math.round(topN)); applied++;
+    }
+    var topC = num(params.skai_top_n_combos, 1, 50);
+    if (topC !== null) {
+      setHidden('skai-ai-top-n-combos', Math.round(topC)); applied++;
+    }
+
+    // -- User feedback ---------------------------------------------------------
+    var fb = document.getElementById('skai-saved-template-feedback');
+    if (fb) {
+      fb.style.display = 'block';
+      fb.textContent   = applied > 0
+        ? 'Settings loaded. Review the controls below and click Run to use them.'
+        : 'Settings could not be applied (no compatible fields found).';
+      // Auto-hide after 5 seconds
+      try {
+        clearTimeout(fb._hideTimer);
+        fb._hideTimer = setTimeout(function () {
+          fb.style.display = 'none';
+        }, 5000);
+      } catch (_) {}
+    }
+  };
+
+  // [[SKAI_LOAD_AND_RUN]]
+  // Complete Load -> Apply -> Run workflow for saved SKAI configuration templates.
+  // Called by the "Load and Run" buttons in the Saved SKAI Settings panel.
+  //
+  // Steps:
+  //   1. Apply all saved values into SKAI controls (delegates to skaiApplySavedTemplate).
+  //   2. Update feedback element to indicate a run is starting.
+  //   3. After a short settle delay, programmatically click startPrediction.
+  //
+  // Safety guards:
+  //   - Does nothing if params is not an object.
+  //   - Does not click if the run button is absent or access-locked.
+  //   - Falls back gracefully with a message in each error path.
+  window.skaiLoadAndRun = function skaiLoadAndRun(params) {
+    if (!params || typeof params !== 'object') { return; }
+
+    // Step 1: Apply all saved settings to SKAI controls.
+    if (typeof window.skaiApplySavedTemplate === 'function') {
+      window.skaiApplySavedTemplate(params);
+    }
+
+    // Step 2: Update the feedback element - override the "click Run" message with
+    //         an "about to run" message so the user knows automation is in progress.
+    var fb = document.getElementById('skai-saved-template-feedback');
+    if (fb) {
+      try { clearTimeout(fb._hideTimer); } catch (_) {}
+      fb.style.display = 'block';
+      fb.style.color   = '#065f46';
+      fb.textContent   = 'Settings loaded. Starting SKAI run...';
+    }
+
+    // Step 3: Trigger the run button after 150 ms so all slider/input change events
+    //         from skaiApplySavedTemplate have had time to propagate to backend state.
+    setTimeout(function () {
+      var runBtn = document.getElementById('startPrediction') ||
+                   document.getElementById('runPrediction');
+
+      if (!runBtn) {
+        if (fb) {
+          fb.style.color = '#92400e';
+          fb.textContent = 'Settings loaded. Run button not found -- please click Generate Numbers manually.';
+        }
+        return;
+      }
+
+      // Do not click if the button is access-locked (non-subscriber).
+      if (runBtn.getAttribute('data-skai-locked-run') === '1' || runBtn.disabled) {
+        if (fb) {
+          fb.style.color = '#92400e';
+          fb.textContent = 'Settings loaded. Unlock SKAI to run predictions.';
+        }
+        return;
+      }
+
+      try {
+        if (typeof runBtn.click === 'function') {
+          runBtn.click();
+        } else {
+          var ev;
+          try {
+            ev = new MouseEvent('click', { bubbles: true, cancelable: true });
+          } catch (_) {
+            ev = document.createEvent('MouseEvents');
+            ev.initEvent('click', true, true);
+          }
+          runBtn.dispatchEvent(ev);
+        }
+      } catch (_) {
+        if (fb) {
+          fb.style.color = '#92400e';
+          fb.textContent = 'Settings loaded. Please click Generate Numbers to run.';
+        }
+      }
+    }, 150);
+  };
+
   function applyProfile(p){
     var spec = PRESETS[p]; if (!spec) return;
 
@@ -29282,6 +29809,121 @@ function hardResetSelections(){
   } else {
     wire();        // existing boot
     wireReset();   // new
+  }
+})();
+</script>
+
+<script>
+/* ===================================================================
+ * MLE RECALL SETTINGS BOOTSTRAP
+ * Reads the 'mle_recall_settings' payload stored in sessionStorage by
+ * the MyLotto "Use These Settings" button and applies the saved config
+ * to the SKAI UI controls (profile/strategy chips, blend slider, and
+ * advanced parameters). Runs once on DOMContentLoaded, then clears the
+ * sessionStorage entry so it does not re-apply on subsequent page loads.
+ * =================================================================== */
+;(function(){
+  'use strict';
+  if (window.__MLE_RECALL_APPLIED__) { return; }
+  window.__MLE_RECALL_APPLIED__ = true;
+
+  // Only activate when the navigation was triggered by a recall button
+  if (window.location.search.indexOf('mle_recall=1') === -1) { return; }
+
+  function applyRecall() {
+    var raw;
+    try { raw = sessionStorage.getItem('mle_recall_settings'); } catch (_) { return; }
+    if (!raw) { return; }
+    var payload;
+    try { payload = JSON.parse(raw); } catch (_) { return; }
+    // Clear immediately so a manual page refresh doesn't re-apply
+    try { sessionStorage.removeItem('mle_recall_settings'); } catch (_) {}
+
+    var p = payload.params || {};
+
+    // 1. Profile chip (balanced / explorative / conservative)
+    var profile = String(p.profile || p.training_style || p.risk_profile || '').toLowerCase();
+    var strategy = String(p.strategy || p.blend || '').toLowerCase() || 'hybrid';
+    if (profile && typeof window.skaiApplyCombo === 'function') {
+      try { window.skaiApplyCombo(profile, strategy); } catch (_) {}
+    } else if (profile) {
+      var profBtn = document.querySelector('#skai-profile-buttons .btn-chip[data-profile="' + profile + '"]');
+      if (profBtn) { profBtn.click(); }
+      if (strategy) {
+        var stratBtn = document.querySelector('#skai-strategy-buttons .btn-chip[data-strategy="' + strategy + '"]');
+        if (stratBtn) { stratBtn.click(); }
+      }
+    }
+
+    // 2. Blend slider (AI %)
+    var aiPct = null;
+    if (p.skai_blend_ai_pct  !== undefined) { aiPct = Number(p.skai_blend_ai_pct); }
+    else if (p.blend_ai_pct  !== undefined) { aiPct = Number(p.blend_ai_pct); }
+    else if (p.ai_pct        !== undefined) { aiPct = Number(p.ai_pct); }
+    if (aiPct !== null && isFinite(aiPct)) {
+      if (aiPct <= 1) { aiPct = Math.round(aiPct * 100); }
+      aiPct = Math.max(0, Math.min(100, Math.round(aiPct)));
+      var blendSlider = document.getElementById('skai-blend-range');
+      if (blendSlider) {
+        blendSlider.value = String(aiPct);
+        blendSlider.dispatchEvent(new Event('input',  { bubbles: true }));
+        blendSlider.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    // 3. Advanced settings sliders/inputs
+    var advMap = {
+      epochs              : 'epochs',
+      batch_size          : 'batch',
+      dropout_rate        : 'dropout',
+      learning_rate       : 'lr',
+      recency_decay       : 'decay',
+      skai_window_size    : 'window',
+      hidden_layers       : 'layers',
+      sampling_temperature: 'temp',
+      diversity_penalty   : 'diversity',
+      gap_scale           : 'gap'
+    };
+    function setAdv(base, val) {
+      var v = String(val);
+      var sld = document.getElementById('skaiadv_' + base);
+      var num = document.getElementById('skaiadv_' + base + '_num');
+      if (sld) { sld.value = v; sld.dispatchEvent(new Event('input',  { bubbles: true })); sld.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (num) { num.value = v; num.dispatchEvent(new Event('input',  { bubbles: true })); num.dispatchEvent(new Event('change', { bubbles: true })); }
+    }
+    for (var key in advMap) {
+      if (Object.prototype.hasOwnProperty.call(advMap, key) && p[key] !== undefined && p[key] !== '') {
+        setAdv(advMap[key], p[key]);
+      }
+    }
+
+    // 4. Activation function select
+    if (p.activation_function !== undefined && p.activation_function !== '') {
+      var actSel = document.getElementById('skaiadv_activation');
+      if (actSel) {
+        actSel.value = String(p.activation_function);
+        actSel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    // Notify the page that settings were applied from an external recall
+    try {
+      window.dispatchEvent(new CustomEvent('skai:settings:applied', {
+        detail: { source: 'mle_recall', lotteryId: payload.lotteryId, settingId: payload.settingId },
+        bubbles: true
+      }));
+    } catch (_) {}
+
+    if (window.console) {
+      console.info('[MLE Recall] Settings applied from saved configuration #' + payload.settingId);
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', applyRecall, { once: true });
+  } else {
+    // Small delay so skaiApplyCombo / chip wiring have a chance to complete
+    setTimeout(applyRecall, 150);
   }
 })();
 </script>
@@ -48845,6 +49487,88 @@ document.addEventListener('DOMContentLoaded', function () {
     } catch (_) {}
   }
 
+  // [FIX-INTERCEPT-POPULATE] Helper called by interceptSaveForm BEFORE form serialization.
+  // Populates numbers_json, main_numbers, main_numbers_csv, daily_top_combos_json, pick_length,
+  // and allow_zero from the live SKAI globals that are guaranteed to exist after a run.
+  // This is necessary because the document-level bubble-phase submit handler (Block B /
+  // skaiPrepareAiSave) never fires when interceptSaveForm calls stopPropagation() during
+  // the form's capture/target phase.
+  window._skaiPopulateFormFields = function(form) {
+    if (!form) { return; }
+    var _meta    = window.SKAI_META || {};
+    var _isDaily = !!(_meta.isDailyDigitGame || _meta.isDaily) && !_meta.isStandardLotteryGame;
+    var _pick    = parseInt(_meta.pick || _meta.pickSize || _meta.pickMain || 0, 10) || 0;
+
+    // Only write to a field when it is currently empty / unpopulated to avoid stomping over
+    // values that a prior code path already set correctly.
+    var _set = function(name, val) {
+      if (val === null || val === undefined || val === '') { return; }
+      var fld = form.querySelector('input[name="' + name + '"]');
+      if (fld && (fld.value === '' || fld.value === '[]' || fld.value === 'null')) {
+        try { fld.value = String(val); } catch(_) {}
+      }
+    };
+
+    if (_isDaily && window.SKAI_DAILY_CHOSEN_COMBOS && window.SKAI_DAILY_CHOSEN_COMBOS.length) {
+      var _combos   = window.SKAI_DAILY_CHOSEN_COMBOS;
+      var _first    = _combos[0] || {};
+      var _firstArr = Array.isArray(_first.combo) ? _first.combo
+                    : (Array.isArray(_first.main) ? _first.main : []);
+      var _displays = [];
+      var _dtcArr   = [];
+      var _extraArr = (window.SKAI_DAILY_EXTRA_DIGITS || []).slice(0, 3);
+      for (var _ci = 0; _ci < _combos.length && _ci < 5; _ci++) {
+        var _cc = Array.isArray(_combos[_ci].combo) ? _combos[_ci].combo
+                : (Array.isArray(_combos[_ci].main) ? _combos[_ci].main : []);
+        var _cd = (typeof window.SKAI_formatDailyComboDisplay === 'function')
+          ? window.SKAI_formatDailyComboDisplay(_cc, _pick || _cc.length)
+          : _cc.join('');
+        if (_cd) {
+          _displays.push(_cd);
+          _dtcArr.push({ rank: _ci + 1, combo: _cc.slice(), display: _cd, score: (_combos[_ci].score || 0), approxPct: (_combos[_ci].approxPct || 0) });
+        }
+      }
+      if (_displays.length) {
+        var _numJson = {
+          main_numbers:               _displays.slice(),
+          extra_numbers:              _extraArr.slice(),
+          daily_top_combo_strings:    _displays.slice(),
+          daily_primary_combo_digits: _firstArr.slice(),
+          daily_primary_combo_display: _displays[0]
+        };
+        _set('numbers_json',          JSON.stringify(_numJson));
+        _set('main_numbers',          JSON.stringify(_displays));
+        _set('main_numbers_csv',      _displays.join(','));
+        try { _set('daily_top_combos_json', JSON.stringify(_dtcArr)); } catch(_) {}
+        if (_pick > 0) { _set('pick_length', String(_pick)); }
+        _set('allow_zero', '1');
+      }
+    } else if (!_isDaily) {
+      // Standard lottery: populate from skaiSaveMainOrdered / SKAI_FINAL_PREDICTION_SETS
+      var _stdMain  = (window.skaiSaveMainOrdered && window.skaiSaveMainOrdered.length)
+                    ? window.skaiSaveMainOrdered.slice(0, 20)
+                    : [];
+      var _stdExtra = (window.skaiSaveExtraOrdered && window.skaiSaveExtraOrdered.length)
+                    ? window.skaiSaveExtraOrdered.slice(0, 5)
+                    : [];
+      if (!_stdMain.length && window.SKAI_FINAL_PREDICTION_SETS && window.SKAI_FINAL_PREDICTION_SETS.length) {
+        var _fps0 = window.SKAI_FINAL_PREDICTION_SETS[0] || {};
+        _stdMain = Array.isArray(_fps0.main) ? _fps0.main.slice()
+                 : (Array.isArray(_fps0.values) ? _fps0.values.slice() : []);
+      }
+      if (_stdMain.length) {
+        var _stdJson = { main_numbers: _stdMain, extra_numbers: _stdExtra };
+        _set('numbers_json',     JSON.stringify(_stdJson));
+        _set('main_numbers',     JSON.stringify(_stdMain));
+        _set('main_numbers_csv', _stdMain.join(','));
+        if (_stdExtra.length) {
+          _set('extra_ball_numbers',     JSON.stringify(_stdExtra));
+          _set('extra_ball_numbers_csv', _stdExtra.join(','));
+        }
+      }
+    }
+  };
+
   function interceptSaveForm(form) {
     if (!form || form.__skaiSaveIntercepted) { return; }
     form.__skaiSaveIntercepted = true;
@@ -48858,6 +49582,16 @@ document.addEventListener('DOMContentLoaded', function () {
 
       var hint = form.querySelector("[id$=save-hint], [id$=-save-hint]");
       if (hint) { hint.textContent = "Saving..."; }
+
+      // [FIX-INTERCEPT-POPULATE] Proactively populate prediction fields from SKAI globals.
+      // The document-level bubble-phase submit handler (Block B / skaiPrepareAiSave) NEVER
+      // fires because stopPropagation() above prevents the event from reaching the document
+      // in the bubble phase.  Without this call, numbers_json / main_numbers /
+      // daily_top_combos_json are always empty in the POST body and PHP returns
+      // {"ok":false,"reason":"empty_main_numbers"} for every save.
+      if (typeof window._skaiPopulateFormFields === 'function') {
+        try { window._skaiPopulateFormFields(form); } catch (_ppErr) {}
+      }
 
       var data = [];
       var inputs = form.elements;
@@ -49853,11 +50587,17 @@ document.addEventListener('DOMContentLoaded', function () {
     // 2. Build numbers_json payload
     var _njPayload = { main_numbers: _mainNums, extra_numbers: _extraNums };
     if (_bfIsDaily && r.dailyChosenCombos && r.dailyChosenCombos.length) {
-      _njPayload.main_numbers             = _dailyStrings.slice();
-      _njPayload.extra_ball_numbers       = [];
-      _njPayload.daily_top_combo_strings  = _dailyStrings.slice();
+      var _bfBonusDigits = (r.dailyExtraDigits && r.dailyExtraDigits.length) ? r.dailyExtraDigits.slice(0, 3) : [];
+      _njPayload.main_numbers               = _dailyStrings.slice();
+      // [FIX-BATCH-BONUS] Also place bonus digits in extra_numbers so PHP reads them
+      // into $extraArr via $nums['extra_numbers'].  Previously they were only in
+      // daily_bonus_digits (a key PHP never reads for $extraArr), so $extraArr was []
+      // and daily_bonus_digits_json was never saved.
+      _njPayload.extra_numbers              = _bfBonusDigits.slice();
+      _njPayload.extra_ball_numbers         = _bfBonusDigits.slice();
+      _njPayload.daily_top_combo_strings    = _dailyStrings.slice();
       _njPayload.daily_primary_combo_digits = _mainNums.slice();
-      _njPayload.daily_bonus_digits = (r.dailyExtraDigits && r.dailyExtraDigits.length) ? r.dailyExtraDigits.slice(0, 3) : [];
+      _njPayload.daily_bonus_digits         = _bfBonusDigits.slice();
     }
     var _numbersJsonStr = '';
     try { _numbersJsonStr = JSON.stringify(_njPayload); } catch(_) {}
@@ -49896,6 +50636,18 @@ document.addEventListener('DOMContentLoaded', function () {
       _payload['main_numbers']     = JSON.stringify(_dailyStrings.slice());
       _payload['main_numbers_csv'] = _dailyStrings.join(',');
       try { _payload['daily_top_combos_json'] = JSON.stringify(r.dailyChosenCombos); } catch(_) {}
+      // [FIX-BATCH-BONUS] Ensure bonus digits reach PHP $extraArr via extra_ball_numbers
+      if (_bfBonusDigits && _bfBonusDigits.length) {
+        _payload['extra_ball_numbers']     = JSON.stringify(_bfBonusDigits.slice());
+        _payload['extra_ball_numbers_csv'] = _bfBonusDigits.join(',');
+      }
+    }
+    // [FIX-BATCH-DAILY-META] Explicitly set pick_length and allow_zero for daily batch saves
+    // so PHP can detect the game type even when form field was cleared between runs.
+    if (_bfIsDaily) {
+      var _bfPickLen = parseInt((window.SKAI_META && (window.SKAI_META.pick || window.SKAI_META.pickSize)) || 0, 10) || 0;
+      if (_bfPickLen > 0) { _payload['pick_length'] = String(_bfPickLen); }
+      _payload['allow_zero'] = '1';
     }
     // Per-run settings
     _payload['risk_profile']               = _profVal;

@@ -455,10 +455,19 @@ function mylottoexpertResolvePredictionTargetMeta($row)
     $targetGameId = trim((string)(mylottoexpertResolveRowValue($row, 'target_game_id') ?? mylottoexpertResolveRowValue($row, 'game_id') ?? ''));
     $targetLotteryId = (int)(mylottoexpertResolveRowValue($row, 'target_lottery_id') ?? mylottoexpertResolveRowValue($row, 'lottery_id') ?? 0);
     $targetDrawDate = trim((string)(mylottoexpertResolveRowValue($row, 'target_draw_date') ?? mylottoexpertResolveRowValue($row, 'next_draw_date') ?? ''));
+    // [FIX-LEGACY-DATE] Joomla null-date sentinel ('0000-00-00*') is not a real draw date;
+    // clear it so the value is treated as absent rather than propagated as an invalid string.
+    if ($targetDrawDate !== '' && strncmp($targetDrawDate, '0000-00-00', 10) === 0) {
+        $targetDrawDate = '';
+    }
     if ($targetDrawDate !== '') {
         $ts = strtotime($targetDrawDate);
-        if ($ts !== false) {
+        if ($ts !== false && $ts > 0) {
             $targetDrawDate = date('Y-m-d', $ts);
+        } else {
+            // [FIX-LEGACY-DATE] Unparseable or pre-epoch date → treat as absent so downstream
+            // draw lookups receive an empty string rather than a garbage date.
+            $targetDrawDate = '';
         }
     }
     $targetDrawAt = trim((string)(mylottoexpertResolveRowValue($row, 'target_draw_at') ?? mylottoexpertResolveRowValue($row, 'next_draw_at') ?? ''));
@@ -2282,7 +2291,9 @@ $showNewFeatures = mylottoexpertGetUserPref($db, (int) $user->id, 'showNewFeatur
 // Allow POST toggle via form
 if ($app->input->getMethod() === 'POST' && $app->input->post->get('toggle_new_features', '', 'STRING') !== '') {
     if (!\Joomla\CMS\Session\Session::checkToken('post')) {
-        die('Invalid Token');
+        $app->enqueueMessage('Your session has expired. Please refresh and try again.', 'error');
+        $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
+        exit;
     }
     $newVal = $app->input->post->get('new_features_enabled', '0', 'STRING') === '1' ? '1' : '0';
     mylottoexpertSetUserPref($db, (int) $user->id, 'showNewFeatures', $newVal);
@@ -2297,7 +2308,9 @@ $predSortDir  = (strtolower($predSortPref) === 'asc') ? 'ASC' : 'DESC';
 // Allow POST change via form
 if ($app->input->getMethod() === 'POST' && $app->input->post->get('change_sort_dir', '', 'STRING') !== '') {
     if (!\Joomla\CMS\Session\Session::checkToken('post')) {
-        die('Invalid Token');
+        $app->enqueueMessage('Your session has expired. Please refresh and try again.', 'error');
+        $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
+        exit;
     }
     $dir = strtolower($app->input->post->get('pred_sort_dir', 'desc', 'STRING'));
     $dir = ($dir === 'asc') ? 'asc' : 'desc';
@@ -2321,6 +2334,7 @@ if ($app->input->getMethod() === 'POST') {
         ($app->input->post->get('delete_lottery_predictions', '', 'STRING') !== '') ||
         ($app->input->post->getInt('delete_setting_template', 0) > 0) ||
         ($app->input->post->get('save_setting_template', '', 'STRING') !== '') ||
+        ($app->input->post->getInt('update_setting_note', 0) > 0) ||
         ($app->input->post->get('toggle_new_features', '', 'STRING') !== '') ||
         ($app->input->post->get('change_sort_dir', '', 'STRING') !== '') ||
         ($app->input->post->getInt('save_strategy_set', 0) > 0);
@@ -2347,7 +2361,8 @@ if ($app->input->getMethod() === 'POST') {
             $app->enqueueMessage('Prediction deleted.', 'message');
             $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
         } catch (Exception $e) {
-            $app->enqueueMessage('Error deleting: ' . $e->getMessage(), 'error');
+            error_log('[MLE] Error deleting prediction id=' . $id . ': ' . $e->getMessage());
+            $app->enqueueMessage('An error occurred while deleting. Please try again.', 'error');
         }
     }
     // Delete multiple predictions via PRC table checkboxes (comma-separated IDs)
@@ -2367,7 +2382,8 @@ if ($app->input->getMethod() === 'POST') {
                 $app->enqueueMessage($count . ' prediction' . ($count !== 1 ? 's' : '') . ' deleted.', 'message');
                 $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
             } catch (Exception $e) {
-                $app->enqueueMessage('Error deleting: ' . $e->getMessage(), 'error');
+                error_log('[MLE] Error deleting multiple predictions: ' . $e->getMessage());
+                $app->enqueueMessage('An error occurred while deleting. Please try again.', 'error');
             }
         }
     }
@@ -2385,7 +2401,8 @@ if ($app->input->getMethod() === 'POST') {
             $app->enqueueMessage('All predictions deleted.', 'message');
             $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
         } catch (Exception $e) {
-            $app->enqueueMessage('Error deleting all: ' . $e->getMessage(), 'error');
+            error_log('[MLE] Error deleting all predictions for user=' . (int)$user->id . ': ' . $e->getMessage());
+            $app->enqueueMessage('An error occurred while deleting. Please try again.', 'error');
         }
     }
 
@@ -2403,25 +2420,52 @@ if ($doGroupDelete && ($predictionTargetIdPost !== '' || ($lotteryId && $drawDat
         $drawDate   = $drawDateTs !== false ? date('Y-m-d', $drawDateTs) : '';
     }
 
+    // [FIX-DELETE-COLS] $__snCols is defined much later in this file (at the page-render phase).
+    // Fetch column names locally here so the delete handler knows which optional columns exist,
+    // regardless of where in the page lifecycle this POST fires.
+    $__delSnCols = array();
+    try {
+        $__delSnColsRaw = $db->getTableColumns('#__user_saved_numbers', false);
+        $__delSnCols = is_array($__delSnColsRaw) ? array_keys($__delSnColsRaw) : array();
+    } catch (\Throwable $__delE) { $__delSnCols = array(); }
+
+    // Helper: build the draw-date WHERE fragment using target_draw_date (COALESCE) when the
+    // column exists, or next_draw_date as the sole fallback.  Reused in both branches below.
+    $__buildDateCond = function ($date) use ($db, $__delSnCols) {
+        if (in_array('target_draw_date', $__delSnCols, true)) {
+            return 'DATE(COALESCE(' . $db->quoteName('target_draw_date') . ',' . $db->quoteName('next_draw_date') . ')) = ' . $db->quote($date);
+        }
+        return 'DATE(' . $db->quoteName('next_draw_date') . ') = ' . $db->quote($date);
+    };
+
     $q = $db->getQuery(true)
         ->delete($db->quoteName('#__user_saved_numbers'))
         ->where($db->quoteName('user_id') . ' = ' . (int) $user->id);
 
-    if ($predictionTargetIdPost !== '') {
+    // [FIX-DELETE-LEGACY] When prediction_target_id is available (new rows), use it directly.
+    // Older rows may have the column present but empty because they were saved before the
+    // target-identity system was introduced. To delete both old and new rows reliably we
+    // combine: (prediction_target_id = X  OR  (lottery_id = Y AND date = Z)).
+    // The OR ensures legacy rows without a populated prediction_target_id are also removed.
+    $hasPtidCol = in_array('prediction_target_id', $__delSnCols, true);
+    if ($predictionTargetIdPost !== '' && $hasPtidCol && $lotteryId && $drawDate !== '') {
+        $q->where(
+            '(' .
+            $db->quoteName('prediction_target_id') . ' = ' . $db->quote($predictionTargetIdPost) .
+            ' OR (' . $db->quoteName('lottery_id') . ' = ' . $lotteryId . ' AND ' . $__buildDateCond($drawDate) . ')' .
+            ')'
+        );
+    } elseif ($predictionTargetIdPost !== '' && $hasPtidCol) {
         $q->where($db->quoteName('prediction_target_id') . ' = ' . $db->quote($predictionTargetIdPost));
     } else {
         $q->where($db->quoteName('lottery_id') . ' = ' . $lotteryId);
         if ($drawDate !== '') {
-            if (in_array('target_draw_date', $__snCols, true)) {
-                $q->where('DATE(COALESCE(' . $db->quoteName('target_draw_date') . ', ' . $db->quoteName('next_draw_date') . ')) = ' . $db->quote($drawDate));
-            } else {
-                $q->where('DATE(' . $db->quoteName('next_draw_date') . ') = ' . $db->quote($drawDate));
-            }
+            $q->where($__buildDateCond($drawDate));
         }
-        if ($targetDrawSessionPost !== '' && in_array('target_draw_session', $__snCols, true)) {
+        if ($targetDrawSessionPost !== '' && in_array('target_draw_session', $__delSnCols, true)) {
             $q->where('LOWER(TRIM(COALESCE(' . $db->quoteName('target_draw_session') . ', ' . $db->quoteName('draw_session') . '))) = ' . $db->quote($targetDrawSessionPost));
         }
-        if ($targetDrawAtPost !== '' && in_array('target_draw_at', $__snCols, true)) {
+        if ($targetDrawAtPost !== '' && in_array('target_draw_at', $__delSnCols, true)) {
             $q->where('COALESCE(' . $db->quoteName('target_draw_at') . ', ' . $db->quoteName('next_draw_at') . ') = ' . $db->quote($targetDrawAtPost));
         }
     }
@@ -2432,8 +2476,38 @@ if ($doGroupDelete && ($predictionTargetIdPost !== '' || ($lotteryId && $drawDat
         $app->enqueueMessage('Deleted all predictions for this draw.', 'message');
         $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
     } catch (Exception $e) {
-        $app->enqueueMessage('Error deleting group: ' . $e->getMessage(), 'error');
+        error_log('[MLE] Error deleting prediction group for user=' . (int)$user->id . ': ' . $e->getMessage());
+        $app->enqueueMessage('An error occurred while deleting. Please try again.', 'error');
     }
+}
+
+// [[MLE_USER_NOTES_MIGRATION]] Add user_notes column if it does not yet exist.
+// Wrapped in try/catch so it is a no-op on databases that already have the column.
+try {
+    $db->setQuery("ALTER TABLE " . $db->quoteName('#__user_saved_settings') . " ADD COLUMN `user_notes` TEXT NULL DEFAULT NULL");
+    $db->execute();
+} catch (Exception $__e) { /* column already exists — safe to ignore */ }
+
+// Update saved-settings note
+$__noteId = $app->input->post->getInt('update_setting_note', 0);
+if ($__noteId > 0) {
+    $__noteText = $app->input->post->get('user_notes', '', 'STRING');
+    // Limit to 1000 chars and strip control characters except newlines/tabs
+    $__noteText = preg_replace('/[^\P{C}\n\t]/u', '', substr(trim((string)$__noteText), 0, 1000));
+    $q = $db->getQuery(true)
+        ->update($db->quoteName('#__user_saved_settings'))
+        ->set($db->quoteName('user_notes') . ' = ' . $db->quote($__noteText))
+        ->where($db->quoteName('id')      . ' = ' . $__noteId)
+        ->where($db->quoteName('user_id') . ' = ' . (int)$user->id);
+    $db->setQuery($q);
+    try {
+        $db->execute();
+    } catch (Exception $__ne) {
+        error_log('[MLE] Failed to save note for setting id=' . $__noteId . ': ' . $__ne->getMessage());
+        $app->enqueueMessage('An error occurred while saving the note. Please try again.', 'error');
+    }
+    $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
+    exit;
 }
 
 // Delete saved setting template (hardened: use Joomla input filtering)
@@ -2453,16 +2527,19 @@ if ($id > 0) {
             $app->enqueueMessage('Saved setting deleted.', 'message');
             $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
         } catch (Exception $e) {
-            $app->enqueueMessage('Error deleting saved setting: ' . $e->getMessage(), 'error');
+            error_log('[MLE] Error deleting saved setting id=' . $id . ': ' . $e->getMessage());
+            $app->enqueueMessage('An error occurred while deleting the saved setting. Please try again.', 'error');
         }
     }
 
     // Save prediction settings as a named template (hardened: use Joomla input filtering)
     if ($app->input->post->get('save_setting_template', '', 'STRING') !== '') {
-        $settingName = trim($app->input->post->getString('setting_name', ''));
-        $source      = $app->input->post->getString('source', '');
-        $lotteryId   = $app->input->post->getInt('lottery_id', 0);
-        $params      = [];
+        $settingName     = trim($app->input->post->getString('setting_name', ''));
+        $source          = $app->input->post->getString('source', '');
+        $lotteryId       = $app->input->post->getInt('lottery_id', 0);
+        // [[FIX]] Use a scoped name to avoid clobbering the Joomla Registry $params
+        // that the module framework injects and that is used later at render time.
+        $__sstParamsData = [];
 
         // Define expected params based on source
         $keys = match ($source) {
@@ -2498,7 +2575,7 @@ if ($id > 0) {
         foreach ($keys as $k) {
             $val = $app->input->post->get($k, null, 'STRING'); // keep as STRING to avoid behavior changes
             if ($val !== null && $val !== '') {
-                $params[$k] = $val;
+                $__sstParamsData[$k] = $val;
             }
         }
 
@@ -2507,20 +2584,20 @@ if ($id > 0) {
         //   Training Style / Strategy / Mode / Blend
         foreach (['training_style', 'profile', 'strategy', 'skai_run_mode', 'blend',
                   'skai_blend_skip_pct', 'skai_blend_ai_pct'] as $__identKey) {
-            if (!array_key_exists($__identKey, $params)) {
+            if (!array_key_exists($__identKey, $__sstParamsData)) {
                 $__iv = $app->input->post->get($__identKey, null, 'STRING');
                 if ($__iv !== null && $__iv !== '') {
-                    $params[$__identKey] = $__iv;
+                    $__sstParamsData[$__identKey] = $__iv;
                 }
             }
         }
         // Capture the page/context this was saved from (Sky, AI, etc.) for recall display.
         $__pageSaved = trim($app->input->post->getString('page_saved_from', ''));
         if ($__pageSaved !== '') {
-            $params['page_saved_from'] = substr($__pageSaved, 0, 64);
+            $__sstParamsData['page_saved_from'] = substr($__pageSaved, 0, 64);
         }
 
-        if ($settingName && $source && $lotteryId && $params) {
+        if ($settingName && $source && $lotteryId && $__sstParamsData) {
             $q = $db->getQuery(true)
                 ->insert($db->quoteName('#__user_saved_settings'))
                 ->columns(['user_id', 'lottery_id', 'source', 'setting_name', 'params'])
@@ -2529,7 +2606,7 @@ if ($id > 0) {
                     $lotteryId,
                     $db->quote($source),
                     $db->quote($settingName),
-                    $db->quote(json_encode($params, JSON_UNESCAPED_UNICODE))
+                    $db->quote(json_encode($__sstParamsData, JSON_UNESCAPED_UNICODE))
                 ]));
 
             $db->setQuery($q);
@@ -2537,9 +2614,14 @@ if ($id > 0) {
                 $db->execute();
                 $app->enqueueMessage('Settings saved.', 'message');
             } catch (Exception $e) {
-                $app->enqueueMessage('Failed to save: ' . $e->getMessage(), 'error');
+                error_log('[MLE] Failed to save settings template for user=' . (int)$user->id . ': ' . $e->getMessage());
+                $app->enqueueMessage('An error occurred while saving. Please try again.', 'error');
             }
         }
+        // [[FIX]] Always redirect after save (Post-Redirect-Get) to prevent double-submit
+        // and to ensure execution never falls through to render code with $__sstParamsData in scope.
+        $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
+        exit;
     }
 
     // Module keys needed for save_strategy_set source whitelisting below.
@@ -2696,7 +2778,8 @@ if ($id > 0) {
                 $db->execute();
                 $app->enqueueMessage('Strategy saved to Saved Numbers.', 'message');
             } catch (Exception $e) {
-                $app->enqueueMessage('Error saving strategy: ' . $e->getMessage(), 'error');
+                error_log('[MLE] Error saving strategy for user=' . (int)$user->id . ': ' . $e->getMessage());
+                $app->enqueueMessage('An error occurred while saving the strategy. Please try again.', 'error');
             }
         } else {
             $app->enqueueMessage('Please add at least one number before saving.', 'warning');
@@ -3817,6 +3900,108 @@ h3.title { font-size: 1.5rem; }
 }
 .lottery-group.collapsed .sdi-draw-date {
   font-size: 0.78rem;
+}
+
+/* ── Outer lottery grouping wrapper ──────────────────────────────── */
+.mle-lottery-outer {
+  margin-bottom: 2.25rem;
+}
+.mle-lottery-outer-header {
+  display: -webkit-flex;
+  display: flex;
+  -webkit-align-items: center;
+  align-items: center;
+  gap: 0.6rem;
+  background: #1e293b;
+  color: #f1f5f9;
+  border-radius: 10px 10px 0 0;
+  padding: 0.65rem 1.1rem;
+  cursor: pointer;
+  user-select: none;
+}
+.mle-lottery-outer.body-collapsed .mle-lottery-outer-header {
+  border-radius: 10px;
+}
+.mle-lottery-outer-logo {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  flex-shrink: 0;
+  background: #fff;
+  border-radius: 4px;
+  padding: 2px;
+}
+.mle-lottery-outer-logo-fallback {
+  display: -webkit-inline-flex;
+  display: inline-flex;
+  -webkit-align-items: center;
+  align-items: center;
+  -webkit-justify-content: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: #334155;
+  color: #f1f5f9;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+.mle-lottery-outer-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 0;
+  flex: 1 1 auto;
+  color: #f1f5f9;
+}
+.mle-lottery-outer-badge {
+  font-size: 0.75rem;
+  background: #334155;
+  color: #94a3b8;
+  border-radius: 20px;
+  padding: 0.15rem 0.6rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.mle-lottery-outer-toggle {
+  background: transparent;
+  border: 1px solid #475569;
+  color: #cbd5e1;
+  border-radius: 5px;
+  padding: 0.22rem 0.65rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.mle-lottery-outer-toggle:hover {
+  background: #334155;
+}
+.mle-lottery-outer-body {
+  transition: max-height 0.35s ease-out, opacity 0.25s ease-out;
+  overflow: hidden;
+  max-height: 60000px;
+  opacity: 1;
+}
+.mle-lottery-outer.body-collapsed .mle-lottery-outer-body {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+}
+/* Remove bottom margin from last lottery-group inside an outer wrapper */
+.mle-lottery-outer-body .lottery-group:last-child {
+  margin-bottom: 0;
+}
+/* Indent inner draw cards slightly */
+.mle-lottery-outer-body .lottery-group.card {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.mle-lottery-outer-body .lottery-group.card:not(:first-child) {
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  margin-top: 0.5rem;
 }
 .lottery-group.collapsed .lotto-logo,
 .lottery-group.collapsed .lotto-logo.fallback {
@@ -7628,6 +7813,8 @@ function mylottoexpertLoadLotterySpec($gameId)
     $result = array();
 
     $masterPath = JPATH_ROOT . '/lottery_skip_config.json';
+    $__masterCfg  = null;
+    $__masterSpec = null;
     if (is_file($masterPath)) {
         $raw = json_decode(file_get_contents($masterPath), true);
         if (json_last_error() === JSON_ERROR_NONE && !empty($raw['lotteries'][$gameId]) && is_array($raw['lotteries'][$gameId])) {
@@ -7636,13 +7823,23 @@ function mylottoexpertLoadLotterySpec($gameId)
             if (!isset($cfg['is_daily'])) {
                 $cfg['is_daily'] = false;
             }
-            $result = array(
-                'dbCol'         => (string)($spec['dbCol'] ?? ''),
-                'lotteryConfig' => $cfg,
-                'raw'           => $spec,
-            );
-            $__mleSpecCache[$gameId] = $result;
-            return $result;
+            $__masterDbCol = (string)($spec['dbCol'] ?? '');
+            if ($__masterDbCol !== '') {
+                // [MASTER-PATH] dbCol found in master config: return immediately.
+                $result = array(
+                    'dbCol'         => $__masterDbCol,
+                    'lotteryConfig' => $cfg,
+                    'raw'           => $spec,
+                );
+                $__mleSpecCache[$gameId] = $result;
+                return $result;
+            }
+            // [FIX-DBCOL-FALLTHROUGH] dbCol is absent from the master config entry but the
+            // game IS registered there. Fall through to dailylotteries.json so tableName can
+            // be used as the dbCol fallback. Save the master lotteryConfig so its column
+            // mappings (main_ball_columns etc.) can be merged with the daily row below.
+            $__masterCfg  = $cfg;
+            $__masterSpec = $spec;
         }
     }
 
@@ -7671,9 +7868,24 @@ function mylottoexpertLoadLotterySpec($gameId)
             $dailyRow = $__pool[$gameId];
             break;
         }
-        foreach ($__pool as $__row) {
+        // [FIX-SKY-DAILY-LOOKUP] dailylotteries.json may store Sky Daily entries with lowercase
+        // keys (e.g. "ny_pick3_mid") while the canonical game_id is always uppercase
+        // ("NY_PICK3_MID"). SKAI's skaiDailyLoadByGameId (skai_daily_bridge.php) resolves this
+        // via case-insensitive lookup, but the uppercase-only direct key check above misses them.
+        // Add a lowercase direct key fallback so the entry is found without a full-pool scan.
+        $__lcKey = strtolower($gameId);
+        if ($__lcKey !== $gameId && !empty($__pool[$__lcKey]) && is_array($__pool[$__lcKey])) {
+            $dailyRow = $__pool[$__lcKey];
+            break;
+        }
+        // Inner loop: if neither uppercase nor lowercase direct key matched, scan every entry.
+        // [FIX-SKY-DAILY-LOOKUP] Also use the JSON key ($__iterKey) as a last-resort game_id
+        // when the row has no explicit "game_id"/"gameId"/"gid" field. Sky Daily entries in
+        // dailylotteries.json use the JSON key itself as the identifier without a separate
+        // "game_id" property, so without this fallback the entry is silently skipped.
+        foreach ($__pool as $__iterKey => $__row) {
             if (!is_array($__row)) { continue; }
-            $__rowGameId = strtoupper(trim((string)($__row['game_id'] ?? $__row['gameId'] ?? $__row['gid'] ?? '')));
+            $__rowGameId = strtoupper(trim((string)($__row['game_id'] ?? $__row['gameId'] ?? $__row['gid'] ?? $__iterKey ?? '')));
             if ($__rowGameId === $gameId) {
                 $dailyRow = $__row;
                 break 2;
@@ -7692,7 +7904,7 @@ function mylottoexpertLoadLotterySpec($gameId)
 
     foreach (array(
         'pick_size'             => array('pick_size', 'pickSize', 'daily_pick_size', 'num_main_balls_drawn', 'mainNumbersDrawn'),
-        'num_extra_balls_drawn' => array('num_extra_balls_drawn', 'numExtraBallsDrawn', 'extra_ball_count', 'extraCount'),
+        'num_extra_balls_drawn' => array('num_extra_balls_drawn', 'numExtraBallsDrawn', 'extra_ball_count', 'extraCount', 'extraBallCount'),
         'main_ball_columns'     => array('main_ball_columns', 'mainBallColumns'),
         'extra_ball_columns'    => array('extra_ball_columns', 'extraBallColumns'),
         'extra_ball_column'     => array('extra_ball_column', 'extraBallColumn'),
@@ -7718,10 +7930,35 @@ function mylottoexpertLoadLotterySpec($gameId)
         $dailyCfg['is_daily'] = true;
     }
 
+    // [FIX-MAIN-BALL-COLUMNS] dailylotteries.json entries only carry pickSize, not
+    // main_ball_columns. Without column names the UNION ALL query emits NULL for every
+    // main ball and the draw is never resolved. Auto-derive the ordered column list from
+    // pickSize using the ordinal column names that the results table always has
+    // (first, second, third, fourth, fifth). This runs only when main_ball_columns has
+    // not been set explicitly by either the daily row or the master config.
+    if (empty($dailyCfg['main_ball_columns'])) {
+        $__ps = (int)($dailyCfg['pick_size'] ?? 0);
+        if ($__ps > 0) {
+            $__ordinals = array('first','second','third','fourth','fifth','sixth','seventh','eighth','ninth','tenth');
+            $dailyCfg['main_ball_columns'] = array_slice($__ordinals, 0, min($__ps, count($__ordinals)));
+        }
+    }
+
+    // [FIX-DBCOL-FALLTHROUGH] When the master config had this game but no dbCol, merge its
+    // lotteryConfig on top of the daily one so explicit column mappings, ball counts, and
+    // other settings from the master entry are preserved alongside the daily tableName.
+    if (is_array($__masterCfg)) {
+        foreach ($__masterCfg as $__mk => $__mv) {
+            if ($__mv !== null && $__mv !== '' && $__mv !== array()) {
+                $dailyCfg[$__mk] = $__mv;
+            }
+        }
+    }
+
     $result = array(
         'dbCol'         => (string)($dailyRow['dbCol'] ?? $dailyRow['tableName'] ?? $dailyRow['table_name'] ?? $dailyRow['table'] ?? ''),
         'lotteryConfig' => $dailyCfg,
-        'raw'           => $dailyRow,
+        'raw'           => is_array($__masterSpec) ? array_merge((array)$dailyRow, $__masterSpec) : $dailyRow,
     );
 
     $__mleSpecCache[$gameId] = $result;
@@ -7909,7 +8146,28 @@ function getDrawByDate($gameId, $date, $db, $drawSession = null, $drawAt = null)
         ->setLimit(1);
 
     $db->setQuery($query);
-    return $db->loadAssoc();
+    $__mleGdbResult = $db->loadAssoc();
+    // [FIX-SESSION-FALLBACK] If the session-filtered query returned no row, retry with a
+    // date-only filter. Session labels stored in the draw table (e.g. 'EVE', 'EV') may not
+    // match the normalized canonical session key saved by SKAI at prediction time (e.g.
+    // 'evening'). Retrying without the session WHERE clause ensures the draw is found as
+    // long as a row exists for that date, while still using draw_at proximity ordering for
+    // the closest match when multiple draws share the same date.
+    if (!is_array($__mleGdbResult) && $drawSession !== '' && in_array('draw_session', $__drawCols, true)) {
+        $__queryFb = $db->getQuery(true)
+            ->select('*')
+            ->from($db->quoteName($realTable))
+            ->where($db->quoteName('game_id') . ' = ' . $db->quote((string)$gameId))
+            ->where('DATE(' . $db->quoteName('draw_date') . ') = ' . $db->quote($dateOnly));
+        if ($drawAtNorm !== '' && in_array('draw_date', $__drawCols, true)) {
+            $__queryFb->order('ABS(TIMESTAMPDIFF(SECOND,' . $db->quote($drawAtNorm) . ',' . $db->quoteName('draw_date') . ')) ASC');
+        }
+        $__queryFb->order($db->quoteName('draw_date') . ' DESC')
+            ->setLimit(1);
+        $db->setQuery($__queryFb);
+        $__mleGdbResult = $db->loadAssoc();
+    }
+    return is_array($__mleGdbResult) ? $__mleGdbResult : null;
 }
 
 /**
@@ -8050,11 +8308,17 @@ function mylottoexpertExtractDrawNumbersFromRow($gameId, $row)
     // Final defensive fallback: if this is a raw draw row with numeric fields but no config match,
     // scan numeric fields while excluding common metadata and already-used extra fields.
     if (empty($result['main'])) {
+        // [FIX-DRAW-RESULTS] draw_results is a composite representation string (e.g. '502' for
+        // Pick3, or '5-12-23-33-42' for regular lotteries). It must be excluded from the
+        // defensive scan so it is never mistaken for a single ball value. Without this exclusion,
+        // '502' would be read as intval 502 and inserted BEFORE the real ordinal columns
+        // (first, second, third...) which appear later in the row, causing positional misalignment
+        // in daily combo comparison and producing 0 hits for a correct Pick3 prediction.
         $metaFields = array(
             'id','asset_id','state','ordering','checked_out','checked_out_time',
             'created_by','modified_by','country','stateprov_name','stateprov_id',
             'game_id','game_name','draw_date','next_draw_date','next_jackpot',
-            'req_date'
+            'req_date','draw_results'
         );
         $__extraColSet = array_flip($extrasArr);
         foreach ($row as $k => $v) {
@@ -8071,6 +8335,29 @@ function mylottoexpertExtractDrawNumbersFromRow($gameId, $row)
                 continue;
             }
             $result['main'][] = (int)$v;
+        }
+    }
+
+    // [FIX-LEGACY-DRAW-RESULTS] Backward-compatible fallback for regular lotteries whose
+    // lottery_skip_config.json entry is missing main_ball_columns. In that case every path
+    // above leaves result['main'] empty. Parse the draw_results column (format:
+    // 'N-N-N-N-N' or 'N-N-N-N-N+E') as a dash-separated ball list so that older saved
+    // predictions for such games still resolve to a real draw and score correctly.
+    // Daily games are protected: their draw_results is a plain digit string ('502', etc.)
+    // which does NOT match the /^\d+(?:-\d+){2,}$/ pattern and is therefore skipped.
+    if (empty($result['main']) && array_key_exists('draw_results', $row) && $row['draw_results'] !== '' && $row['draw_results'] !== null) {
+        // Strip optional '+E' extra-ball suffix (e.g. '7-14-21-33-48+3') before matching.
+        // Use /\+\d+$/ so only a numeric +Bonus tail is removed; other '+' characters are kept.
+        $__drStripped = preg_replace('/\+\d+$/', '', (string)$row['draw_results']);
+        // Require at least 3 dash-separated parts (e.g. 'N-N-N') to distinguish a regular
+        // lottery ball list from a plain digit string used by daily games ('502', '1234', etc.)
+        if (preg_match('/^\d+(?:-\d+){2,}$/', trim($__drStripped))) {
+            foreach (explode('-', trim($__drStripped)) as $__drPart) {
+                $__drNum = (int)$__drPart;
+                if ($__drNum > 0) {
+                    $result['main'][] = $__drNum;
+                }
+            }
         }
     }
 
@@ -8530,6 +8817,11 @@ function buildLotteryLogoPath(string $stateName, string $gameName): array
     $abbrLower = strtolower($abbrUpper);          // e.g., az
 
     // Your exact spec: str_replace(' ','-', strtolower($gName))
+    // Sanitize $gameName before slug building using an allowlist approach to prevent path traversal.
+    // URL-decode first to catch encoded traversal sequences (%2e%2e, %2f, etc.), then strip to
+    // safe characters only. This preserves all valid lottery name characters for slug generation.
+    $gameName  = urldecode((string)$gameName);
+    $gameName  = preg_replace('/[^A-Za-z0-9 \'\-\&\(\)\.]/', '', $gameName);
     $slugExact = str_replace(' ', '-', strtolower($gameName));
 
     // A safer fallback slug (strip punctuation, compress dashes)
@@ -8593,9 +8885,13 @@ function scoreRunFromDrawMap($drawMap, $gameId, $drawDate, array $predMain, $pre
     }
 
     // Count main-ball hits
+    // [FIX-DAILY-ZERO] Do not skip digit 0: for daily lotteries (Pick3/4/5), 0 is a valid
+    // ball digit and must be counted as a hit when it appears in both prediction and draw.
+    // For regular lotteries, drawMain never contains 0 (balls are 1-based, e.g. 1-49), so
+    // removing the $n !== 0 guard does not affect regular lottery hit counting.
     $hitsMain = 0;
     foreach ($predMain as $n) {
-        if ($n !== 0 && in_array((int)$n, $drawMain, true)) {
+        if (in_array((int)$n, $drawMain, true)) {
             $hitsMain++;
         }
     }
@@ -8863,7 +9159,12 @@ foreach ($savedSets as $s) {
     $__targetMeta = mylottoexpertResolvePredictionTargetMeta($s);
     $__groupKey   = mylottoexpertBuildGroupIdentity($__targetMeta);
     $__groupGameId = $__targetMeta['target_game_id'] !== '' ? $__targetMeta['target_game_id'] : (string)$s->game_id;
-    $__groupDrawDate = $__targetMeta['target_draw_date'] !== '' ? $__targetMeta['target_draw_date'] : (string)$s->next_draw_date;
+    // [FIX-LEGACY-DATE] Sanitize the next_draw_date fallback: Joomla stores NULL dates as
+    // '0000-00-00 00:00:00'. Passing that through to getDrawByDate causes strtotime() to
+    // return false, silently producing no draw match even for predictions that had a real draw.
+    $__nextDateRaw = trim((string)$s->next_draw_date);
+    if (strncmp($__nextDateRaw, '0000-00-00', 10) === 0) { $__nextDateRaw = ''; }
+    $__groupDrawDate = $__targetMeta['target_draw_date'] !== '' ? $__targetMeta['target_draw_date'] : $__nextDateRaw;
 
     if (!isset($groups[$__groupKey])) {
         $groups[$__groupKey] = array(
@@ -9212,7 +9513,8 @@ foreach ($groups as $groupKey => $g) {
                             $__bk = 'main_' . $__bi;
                             if (isset($__bkRow[$__bk]) && $__bkRow[$__bk] !== '' && $__bkRow[$__bk] !== null) {
                                 $__bv = (int)$__bkRow[$__bk];
-                                if ($__bv) { $__bkMain[] = $__bv; }
+                                // [FIX-DAILY-ZERO] Allow digit 0 for daily games (Pick3/4/5 use 0 as a valid digit).
+                                if ($__isDailyPred || $__bv !== 0) { $__bkMain[] = $__bv; }
                             }
                         }
                         // Read all extra_ball_N aliases (cap at 10; breaks on first absent alias)
@@ -9220,7 +9522,8 @@ foreach ($groups as $groupKey => $g) {
                             $__bek = $__bei === 0 ? 'extra_ball' : 'extra_ball_' . ($__bei + 1);
                             if (isset($__bkRow[$__bek]) && $__bkRow[$__bek] !== '' && $__bkRow[$__bek] !== null) {
                                 $__bv = (int)$__bkRow[$__bek];
-                                if ($__bv) { $__bkExtra[] = $__bv; }
+                                // [FIX-DAILY-ZERO] Allow digit 0 for daily games.
+                                if ($__isDailyPred || $__bv !== 0) { $__bkExtra[] = $__bv; }
                             } else {
                                 break;
                             }
@@ -9452,7 +9755,9 @@ foreach ($groups as $__gKey => $__g) {
     $__gTargetAt     = trim((string)($__g['target_draw_at'] ?? ''));
     $__gTargetSession= mylottoexpertNormalizeTargetSession($__g['target_draw_session'] ?? '');
     $__fbCacheKey    = $__g['game_id'] . '|' . $__gDateNorm . '|' . ($__gTargetAt !== '' ? $__gTargetAt : 'no-time') . '|' . ($__gTargetSession !== '' ? $__gTargetSession : 'no-session');
-    $__drawMapLegacyKey = $__g['game_id'] . '|' . $__gDateNorm;
+    // [FIX-SKY-DAILY-LOOKUP] drawMap keys are always lowercase (see strtolower() when building
+    // the map). Lowercasing here ensures the legacy lookup matches for any game_id case.
+    $__drawMapLegacyKey = strtolower((string)($__g['game_id'] ?? '')) . '|' . $__gDateNorm;
     $__preferCanonicalDrawLookup = ($__gTargetAt !== '' || $__gTargetSession !== '');
 
     // ── Fetch draw for this canonical target (cached per game+date+time/session) ──
@@ -9461,7 +9766,22 @@ foreach ($groups as $__gKey => $__g) {
     if (!array_key_exists($__fbCacheKey, $__prcDrawCache)) {
         $__grpMain  = array();
         $__grpExtra = array();
-        $__groupHasDaily = false;
+        // [FIX-DAILY-FLAG] Initialize the daily flag from the group-level canonical target
+        // metadata FIRST, before probing individual prediction rows. A prediction that was
+        // saved with target_prediction_family='daily' (set by SKAI at save time) must always
+        // be treated as a daily game for draw extraction purposes, regardless of whether
+        // structured daily JSON fields (daily_top_picks_json etc.) are present. This ensures:
+        //   1. Digit 0 is allowed in draw number extraction (valid Pick3/4/5 digit).
+        //   2. The daily raw-row fallback (getDrawByDate on empty drawMap result) runs.
+        // Without this, a daily prediction lacking combo_strings would leave $__groupHasDaily
+        // false, silently exclude the 0 digit, and leave has_draw=false even when the draw occurred.
+        $__groupHasDaily = (strtolower(trim((string)($__g['target_prediction_family'] ?? ''))) === 'daily');
+        if (!$__groupHasDaily) {
+            $__tpt = strtolower(trim((string)($__g['target_prediction_type'] ?? '')));
+            if ($__tpt === 'pick3' || $__tpt === 'pick4' || $__tpt === 'pick5' || $__tpt === 'daily') {
+                $__groupHasDaily = true;
+            }
+        }
         // Probe predictions to detect daily games AND determine how many extra balls are expected.
         // For EuroMillions the extra_ball_numbers field stores both Lucky Stars (e.g. "3,7"),
         // so the prediction count tells us the game has 2 extras even when config only lists 1 column.
@@ -9469,7 +9789,10 @@ foreach ($groups as $__gKey => $__g) {
         foreach (($__g['preds'] ?? array()) as $__predProbe) {
             if (!$__groupHasDaily) {
                 $__dailyProbe = mylottoexpertExtractDailySavedView($__predProbe);
-                if (!empty($__dailyProbe['is_daily']) && !empty($__dailyProbe['combo_strings'])) {
+                // [FIX-DAILY-FLAG] Use is_daily alone (not requiring combo_strings) so that
+                // predictions flagged daily via prediction_family but lacking structured JSON
+                // fields still correctly set the daily gate.
+                if (!empty($__dailyProbe['is_daily'])) {
                     $__groupHasDaily = true;
                 }
             }
@@ -10822,6 +11145,11 @@ foreach ($bestOpps as $__sopp) {
      Saved Predictions & Numbers Section $unionSql
 ================================================== -->
 
+<div class="mle-section-label" style="margin:1.5rem 0 1rem; padding:0 0.25rem;">
+  <h2 style="font-size:1.1rem; font-weight:800; color:#1e293b; margin:0 0 0.35rem;">Your Saved Predictions</h2>
+  <p style="font-size:0.9rem; color:#475569; margin:0; line-height:1.55;">Each card shows a full set of numbers saved for an upcoming or completed draw. Select methods to compare overlap, review hit rates, and identify which configurations performed best against real draw results.</p>
+</div>
+
 <!-- Legend will appear after first prediction group via JavaScript -->
 <div id="legend-card-placeholder" class="skai-card legend-card" style="display:none; margin:1rem 0;">
   <div class="skai-card__header">
@@ -10894,9 +11222,79 @@ foreach ($groups as $__g2) {
     }
 }
 unset($__g2, $__g2Lid);
+
+// ── Build per-lottery grouped list (outer container by lottery, draws sorted newest first) ──
+$__byLottery = array();           // lottery_id => ['lottery_id','lottery_name','groups'=>[...]]
+$__lotteryOrder = array();        // preserve first-seen lottery ordering
+foreach ($groups as $__gKey => $__gVal) {
+    $__lid = (int)$__gVal['lottery_id'];
+    if (!isset($__byLottery[$__lid])) {
+        $__byLottery[$__lid] = array(
+            'lottery_id'   => $__lid,
+            'lottery_name' => (string)$__gVal['lottery_name'],
+            'groups'       => array(),
+        );
+        $__lotteryOrder[] = $__lid;
+    }
+    $__byLottery[$__lid]['groups'][$__gKey] = $__gVal;
+}
+// Within each lottery, sort draws newest-first
+foreach ($__byLottery as &$__lotRef) {
+    uasort($__lotRef['groups'], function ($a, $b) {
+        return strcmp((string)($b['draw_date'] ?? ''), (string)($a['draw_date'] ?? ''));
+    });
+}
+unset($__lotRef);
 ?>
 
-<?php foreach ($groups as $g):
+<?php foreach ($__lotteryOrder as $__outerLid):
+  $__outerLot  = $__byLottery[$__outerLid];
+  $__outerMeta = $lottoMetaById[$__outerLid] ?? [];
+  $__outerState   = $__outerMeta['state']   ?? '';
+  $__outerCountry = $__outerMeta['country'] ?? '';
+  $__outerDrawCount = count($__outerLot['groups']);
+  $__outerLogo = buildLotteryLogoPath((string)$__outerState, (string)$__outerLot['lottery_name']);
+  $__outerStorageKey = 'mle_outer_collapsed_' . $__outerLid;
+?>
+<div class="mle-lottery-outer" data-outer-lottery-id="<?php echo $__outerLid; ?>">
+  <div class="mle-lottery-outer-header" role="button" tabindex="0"
+       aria-expanded="true" aria-label="Toggle <?php echo htmlspecialchars((string)$__outerLot['lottery_name'], ENT_QUOTES); ?> predictions"
+       data-outer-lottery-toggle="<?php echo $__outerLid; ?>">
+    <?php if (!empty($__outerLogo['path'])): ?>
+      <?php if ($__outerLogo['exists']): ?>
+        <img class="mle-lottery-outer-logo"
+             src="<?php echo htmlspecialchars($__outerLogo['path'], ENT_QUOTES); ?>"
+             alt="<?php echo htmlspecialchars($__outerLogo['alt'], ENT_QUOTES); ?>"
+             loading="lazy">
+      <?php else: ?>
+        <?php
+          $__ini = '';
+          foreach (preg_split('/\s+/', (string)$__outerLot['lottery_name']) as $__p) {
+              if ($__p !== '') { $__ini .= mb_strtoupper(mb_substr($__p,0,1)); if (mb_strlen($__ini) >= 2) break; }
+          }
+        ?>
+        <span class="mle-lottery-outer-logo-fallback" aria-hidden="true"><?php echo htmlspecialchars($__ini ?: 'LE', ENT_QUOTES); ?></span>
+      <?php endif; ?>
+    <?php endif; ?>
+    <h2 class="mle-lottery-outer-title">
+      <?php if ($__outerCountry) echo htmlspecialchars($__outerCountry, ENT_QUOTES); ?>
+      <?php if ($__outerState && $__outerState !== 'Lottery'): ?>
+        &nbsp;&bull;&nbsp;<?php echo htmlspecialchars($__outerState, ENT_QUOTES); ?>
+      <?php endif; ?>
+      <?php if (!empty($__outerLot['lottery_name'])): ?>
+        &nbsp;&bull;&nbsp;<?php echo htmlspecialchars((string)$__outerLot['lottery_name'], ENT_QUOTES); ?>
+      <?php endif; ?>
+    </h2>
+    <span class="mle-lottery-outer-badge"><?php echo $__outerDrawCount; ?> drawing<?php echo $__outerDrawCount !== 1 ? 's' : ''; ?></span>
+    <button type="button" class="mle-lottery-outer-toggle"
+            data-outer-lottery-toggle-btn="<?php echo $__outerLid; ?>"
+            aria-label="Collapse <?php echo htmlspecialchars((string)$__outerLot['lottery_name'], ENT_QUOTES); ?>">
+      &#x25BC; Collapse
+    </button>
+  </div>
+  <div class="mle-lottery-outer-body">
+
+<?php foreach ($__outerLot['groups'] as $g):
   $lottoUrl = $lottoUrlsById[$g['lottery_id']] ?? null;
   $meta     = $lottoMetaById[$g['lottery_id']] ?? [];
   $state    = $meta['state'] ?? '';
@@ -12791,6 +13189,10 @@ $methodKeys = ['skip_hit','ai_prediction','mcmc_prediction','skai_prediction','h
 
   <!-- PERFORMANCE TAB -->
   <div class="sdi-panel" data-sdi-panel="performance" role="tabpanel" style="display:none;">
+  <div style="padding:1rem 1rem 0.5rem; border-bottom:1px solid #e2e8f0; margin-bottom:0.75rem;">
+    <h3 style="font-size:1rem; font-weight:800; color:#1e293b; margin:0 0 0.3rem;">Historical Evaluation</h3>
+    <p style="font-size:0.875rem; color:#475569; margin:0; line-height:1.5;">Review how each prediction method ranked actual winning numbers across past draws. Use the placement heatmap and hit-rate data to identify which methods perform most consistently for this lottery.</p>
+  </div>
 
 <div class="card decision-strip" data-decision-strip style="display:none;">
   <div class="decision-strip-header">
@@ -14390,15 +14792,19 @@ if (!empty($settingLabels)) {
 
   <!-- SETTINGS TAB -->
   <div class="sdi-panel" data-sdi-panel="settings" role="tabpanel" style="display:none;">
-    <div style="padding:1.25rem 1rem; font-size:0.9rem; color:#6b7280;">
-      Open individual method cards in the <strong>Methods</strong> tab
-      and click <strong>Details</strong> on any card to access its settings.
+    <div style="padding:1.25rem 1rem 0.5rem;">
+      <h3 style="font-size:1rem; font-weight:800; color:#1e293b; margin:0 0 0.35rem;">Saved Run Details</h3>
+      <p style="font-size:0.875rem; color:#475569; margin:0; line-height:1.5;">Access the exact configuration used in each saved prediction run. Open the <strong>Method Comparison</strong> tab and click <strong>Details</strong> on any card to review the parameters, training style, and settings saved with that run.</p>
     </div>
   </div>
 
     </div>  <!-- end .lottery-collapsible-content -->
     </div>  <!-- end .lottery-group -->
-  <?php endforeach; ?>
+  <?php endforeach; /* inner draw loop */ ?>
+
+  </div>  <!-- end .mle-lottery-outer-body -->
+</div>  <!-- end .mle-lottery-outer -->
+<?php endforeach; /* outer lottery loop */ ?>
 
 <?php endif; ?>
 </div>  <!-- end .prediction-panel -->
@@ -14409,6 +14815,8 @@ $q = $db->getQuery(true)
     ->select([
         's.*',
         'l.name AS lottery_name',
+        'l.game_id AS lottery_game_id',
+        'l.lottery_urls AS lottery_page_url',
         'st.name AS state_name'
     ])
     ->from($db->quoteName('#__user_saved_settings', 's'))
@@ -14544,14 +14952,80 @@ $savedSettings = $db->loadAssocList() ?: [];
             </div>
           <?php endif; ?>
 
+          <?php
+            // [[MLE_RECALL_DATA_ATTR]]
+            // Encode params in a data attribute to avoid JSON_HEX_QUOT \u0022 SyntaxError.
+            // JSON_HEX_QUOT converts " to \u0022; embedded directly in onclick="..." that
+            // causes SyntaxError: missing ) after argument list (my-dashboard:2:2).
+            // htmlspecialchars with ENT_QUOTES stores " as &quot; in the attribute; the
+            // browser decodes it back to " when getAttribute() is called, so JSON.parse
+            // receives valid JSON.
+            $__mleParamsAttr = htmlspecialchars(
+                json_encode($params, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_UNESCAPED_UNICODE),
+                ENT_QUOTES, 'UTF-8'
+            );
+            $__mleNoteAttr = htmlspecialchars((string)($set['user_notes'] ?? ''), ENT_QUOTES, 'UTF-8');
+          ?>
+          <!-- User note display -->
+          <?php if ($__mleNoteAttr !== ''): ?>
+          <div class="mle-saved-note-display"
+               id="mle-note-display-<?php echo (int)$set['id']; ?>"
+               style="margin-top:0.5rem;padding:6px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;font-size:0.82rem;color:#475569;line-height:1.5;">
+            <strong style="color:#334155;">Note:</strong> <?php echo nl2br(htmlspecialchars((string)($set['user_notes'] ?? ''), ENT_QUOTES, 'UTF-8')); ?>
+          </div>
+          <?php else: ?>
+          <div class="mle-saved-note-display"
+               id="mle-note-display-<?php echo (int)$set['id']; ?>"
+               style="display:none;margin-top:0.5rem;padding:6px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;font-size:0.82rem;color:#475569;line-height:1.5;"></div>
+          <?php endif; ?>
+
+          <!-- Inline note editor (hidden by default; toggled by JS) -->
+          <div class="mle-saved-note-editor"
+               id="mle-note-editor-<?php echo (int)$set['id']; ?>"
+               style="display:none;margin-top:0.5rem;">
+            <form method="post" style="margin:0;"
+                  onsubmit="return mleSaveNote(event,<?php echo (int)$set['id']; ?>);">
+              <?php echo \Joomla\CMS\HTML\HTMLHelper::_('form.token'); ?>
+              <input type="hidden" name="update_setting_note" value="<?php echo (int)$set['id']; ?>">
+              <textarea name="user_notes"
+                        rows="3"
+                        maxlength="1000"
+                        placeholder="Add a personal note about this setting…"
+                        style="width:100%;font-size:0.82rem;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;resize:vertical;box-sizing:border-box;"
+                        ><?php echo htmlspecialchars((string)($set['user_notes'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></textarea>
+              <div style="display:flex;gap:6px;margin-top:4px;">
+                <button type="submit"
+                        style="font-size:0.75rem;padding:3px 12px;background:#1C66FF;color:#fff;border:1px solid #1553d4;border-radius:5px;cursor:pointer;font-weight:600;">
+                  Save Note
+                </button>
+                <button type="button"
+                        style="font-size:0.75rem;padding:3px 10px;border:1px solid #cbd5e1;border-radius:5px;cursor:pointer;"
+                        onclick="mleToggleNoteEditor(<?php echo (int)$set['id']; ?>,false);">
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+
           <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:0.6rem;align-items:center;">
             <em style="font-size:0.78rem;color:#94a3b8;">Would you like to use these saved settings?</em>
             <button type="button"
               class="btn-secondary"
+              data-mle-params="<?php echo $__mleParamsAttr; ?>"
+              data-mle-lottery-url="<?php echo htmlspecialchars((string)($set['lottery_page_url'] ?? ''), ENT_QUOTES, 'UTF-8'); ?>"
+              data-mle-game-id="<?php echo htmlspecialchars((string)($set['lottery_game_id'] ?? ''), ENT_QUOTES, 'UTF-8'); ?>"
+              data-mle-source="<?php echo htmlspecialchars((string)($set['source'] ?? ''), ENT_QUOTES, 'UTF-8'); ?>"
               style="font-size:0.75rem;padding:0.25rem 0.75rem;"
-              onclick="mylottoRecallSettings(<?php echo (int)$set['id']; ?>,<?php echo (int)$set['lottery_id']; ?>,<?php echo json_encode($params, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_UNESCAPED_UNICODE); ?>)"
+              onclick="mleApplyRecallSettings(this,<?php echo (int)$set['id']; ?>,<?php echo (int)$set['lottery_id']; ?>);return false;"
               aria-label="Apply saved settings: <?php echo htmlspecialchars($set['setting_name'], ENT_QUOTES, 'UTF-8'); ?>">
               &#x2197; Use These Settings
+            </button>
+            <button type="button"
+              data-note-toggle="<?php echo (int)$set['id']; ?>"
+              style="font-size:0.75rem;padding:0.25rem 0.75rem;border:1px solid #cbd5e1;border-radius:5px;cursor:pointer;background:#f8fafc;"
+              onclick="mleToggleNoteEditor(<?php echo (int)$set['id']; ?>,true);"
+              aria-label="Add or edit note for: <?php echo htmlspecialchars($set['setting_name'], ENT_QUOTES, 'UTF-8'); ?>">
+              &#x1F4DD; <?php echo ($__mleNoteAttr !== '') ? 'Edit Note' : 'Add Note'; ?>
             </button>
 
 <form method="post" style="display:inline;" data-confirm-submit="Delete this saved settings template?">
@@ -16721,6 +17195,22 @@ function convertTimestampsToLocal() {
 // Run timestamp conversion after DOM is ready
 convertTimestampsToLocal();
 
+function initOuterLotteryCollapse() {
+  Array.prototype.forEach.call(document.querySelectorAll('.mle-lottery-outer'), function(outerEl) {
+    var lid = outerEl.getAttribute('data-outer-lottery-id') || '';
+    var storageKey = lid ? ('mle_outer_collapsed_' + lid) : '';
+    try {
+      if (storageKey && localStorage.getItem(storageKey) === 'true') {
+        outerEl.classList.add('body-collapsed');
+        var btn = outerEl.querySelector('.mle-lottery-outer-toggle');
+        if (btn) { btn.textContent = '\u25b6 Expand'; }
+      }
+    } catch (e) {}
+  });
+}
+
+initOuterLotteryCollapse();
+
 // Lottery section collapse/expand: restore initial state from localStorage.
 // Click handling is done by data-lottery-toggle-btn="1" on the button.
 function initLotteryCollapse() {
@@ -17006,6 +17496,29 @@ initLotteryCollapse();
 
 /* ===== merged script section ===== */
 
+// ============================================================
+// Outer lottery group collapse (mle-lottery-outer)
+// Persists state per lottery in localStorage.
+// ============================================================
+function mleOuterLotteryToggle(outerEl) {
+  if (!outerEl) return;
+  var lid = outerEl.getAttribute('data-outer-lottery-id') || '';
+  var storageKey = lid ? ('mle_outer_collapsed_' + lid) : '';
+  var btn = outerEl.querySelector('.mle-lottery-outer-toggle');
+  var isCollapsed = outerEl.classList.contains('body-collapsed');
+  if (isCollapsed) {
+    outerEl.classList.remove('body-collapsed');
+    if (btn) { btn.textContent = '\u25bc Collapse'; }
+    outerEl.setAttribute('aria-expanded', 'true');
+    if (storageKey) { try { localStorage.setItem(storageKey, 'false'); } catch(e) {} }
+  } else {
+    outerEl.classList.add('body-collapsed');
+    if (btn) { btn.textContent = '\u25b6 Expand'; }
+    outerEl.setAttribute('aria-expanded', 'false');
+    if (storageKey) { try { localStorage.setItem(storageKey, 'true'); } catch(e) {} }
+  }
+}
+
   function scrollToFavorites() {
     var el = document.getElementById('favorite-lotteries');
     if (!el) {
@@ -17178,15 +17691,22 @@ function skaiLotteryToggle(btn) {
 }
 
 // ============================================================
-// skaiLotteryToggleAll: Collapse / expand ALL lottery-group sections.
+// skaiLotteryToggleAll: Collapse / expand ALL lottery-group sections
+// AND all outer mle-lottery-outer wrappers.
 // Updates each group's localStorage key and syncs per-group toggle buttons.
 // ES5-compatible; no dependencies.
 // ============================================================
 function skaiLotteryToggleAll(btn) {
   var groups = document.querySelectorAll('.lottery-group');
+  var outers = document.querySelectorAll('.mle-lottery-outer');
   var shouldCollapse = false;
   for (var i = 0; i < groups.length; i++) {
     if (!groups[i].classList.contains('collapsed')) { shouldCollapse = true; break; }
+  }
+  if (!shouldCollapse) {
+    for (var oi = 0; oi < outers.length; oi++) {
+      if (!outers[oi].classList.contains('body-collapsed')) { shouldCollapse = true; break; }
+    }
   }
   for (var j = 0; j < groups.length; j++) {
     var group      = groups[j];
@@ -17210,6 +17730,22 @@ function skaiLotteryToggleAll(btn) {
         toggle.setAttribute('aria-label', 'Collapse lottery section');
       }
       if (storageKey) { try { localStorage.setItem(storageKey, 'false'); } catch(e) {} }
+    }
+  }
+  // Also toggle outer lottery wrappers
+  for (var ok = 0; ok < outers.length; ok++) {
+    var outerEl   = outers[ok];
+    var outerLid  = outerEl.getAttribute('data-outer-lottery-id') || '';
+    var outerKey  = outerLid ? ('mle_outer_collapsed_' + outerLid) : '';
+    var outerBtn  = outerEl.querySelector('.mle-lottery-outer-toggle');
+    if (shouldCollapse) {
+      outerEl.classList.add('body-collapsed');
+      if (outerBtn) { outerBtn.textContent = '\u25b6 Expand'; }
+      if (outerKey) { try { localStorage.setItem(outerKey, 'true'); } catch(e) {} }
+    } else {
+      outerEl.classList.remove('body-collapsed');
+      if (outerBtn) { outerBtn.textContent = '\u25bc Collapse'; }
+      if (outerKey) { try { localStorage.setItem(outerKey, 'false'); } catch(e) {} }
     }
   }
   if (btn) {
@@ -18359,6 +18895,7 @@ if (typeof window !== 'undefined') {
   window.mlePrintHistoricalLottery = mlePrintHistoricalLottery;
   window.skaiLotteryToggle = skaiLotteryToggle;
   window.skaiLotteryToggleAll = skaiLotteryToggleAll;
+  window.mleOuterLotteryToggle = mleOuterLotteryToggle;
   window.mlePrintCard = mlePrintCard;
   window.mlePrintGroup = mlePrintGroup;
 }
@@ -18444,6 +18981,27 @@ document.addEventListener('click', function(evt) {
       skaiLotteryToggle(node);
       return;
     }
+    // Outer lottery-group toggle (new two-level grouping)
+    if (node.getAttribute && node.getAttribute('data-outer-lottery-toggle-btn') !== null) {
+      var outerEl = node.closest ? node.closest('.mle-lottery-outer') : (function() {
+        var el = node;
+        while (el && !(el.classList && el.classList.contains('mle-lottery-outer'))) { el = el.parentElement; }
+        return el;
+      }());
+      if (outerEl) { mleOuterLotteryToggle(outerEl); }
+      if (evt.stopPropagation) { evt.stopPropagation(); } else { evt.cancelBubble = true; }
+      return;
+    }
+    // Click on the outer header itself (anywhere except the inner button)
+    if (node.getAttribute && node.getAttribute('data-outer-lottery-toggle') !== null) {
+      var outerEl2 = node.closest ? node.closest('.mle-lottery-outer') : (function() {
+        var el = node;
+        while (el && !(el.classList && el.classList.contains('mle-lottery-outer'))) { el = el.parentElement; }
+        return el;
+      }());
+      if (outerEl2) { mleOuterLotteryToggle(outerEl2); }
+      return;
+    }
     if (node.getAttribute && node.getAttribute('data-print-group-btn') === '1') {
       mlePrintGroup(node);
       return;
@@ -18483,6 +19041,111 @@ document.addEventListener('submit', function(evt) {
     }
   }
 });
+
+/**
+ * mleToggleNoteEditor — show or hide the inline note editor for a saved settings card.
+ * @param {number}  settingId - DB id of the saved settings row
+ * @param {boolean} show      - true = open editor, false = close editor
+ */
+function mleToggleNoteEditor(settingId, show) {
+  var editor  = document.getElementById('mle-note-editor-'  + settingId);
+  var display = document.getElementById('mle-note-display-' + settingId);
+  if (!editor) { return; }
+  editor.style.display  = show ? 'block' : 'none';
+  if (display) { display.style.display = show ? 'none' : (display.textContent.trim() ? 'block' : 'none'); }
+  if (show) {
+    var ta = editor.querySelector('textarea');
+    if (ta) { ta.focus(); }
+  }
+}
+
+/**
+ * mleSaveNote — submit the note form via fetch so the page does not reload.
+ * Falls back to normal form submit if fetch is unavailable.
+ * @param {Event}  evt       - form submit event
+ * @param {number} settingId - DB id of the saved settings row
+ */
+function mleSaveNote(evt, settingId) {
+  evt.preventDefault();
+  var form = evt.target;
+  if (typeof fetch === 'undefined') { form.submit(); return false; }
+  var data = new FormData(form);
+  fetch(window.location.href, { method: 'POST', body: data, credentials: 'same-origin' })
+    .then(function(r) { return r.ok ? r.text() : Promise.reject(r.status); })
+    .then(function() {
+      var ta      = form.querySelector('textarea[name="user_notes"]');
+      var noteVal = ta ? ta.value.trim() : '';
+      var display = document.getElementById('mle-note-display-' + settingId);
+      if (display) {
+        display.innerHTML = noteVal
+          ? '<strong style="color:#334155;">Note:</strong> ' + noteVal.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')
+          : '';
+        display.style.display = noteVal ? 'block' : 'none';
+      }
+      // Update "Add Note / Edit Note" toggle buttons using data-note-toggle attribute
+      var btns = document.querySelectorAll('[data-note-toggle="' + settingId + '"]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].innerHTML = (noteVal ? '&#x1F4DD; Edit Note' : '&#x1F4DD; Add Note');
+      }
+      mleToggleNoteEditor(settingId, false);
+    })
+    .catch(function(err) {
+      // Inform the user before falling back to a full-page submit
+      var statusMsg = err ? ' (status ' + err + ')' : '';
+      if (window.console) { console.warn('[MLE] Note save via fetch failed' + statusMsg + '; retrying via form submit.'); }
+      form.submit();
+    });
+  return false;
+}
+
+/**
+ * mleApplyRecallSettings — "Use These Settings" button handler.
+ * Stores the saved settings in sessionStorage under 'mle_recall_settings' so that the
+ * SKAI page can read and apply them on load, then navigates to the lottery's SKAI page.
+ * Falls back to the in-page CustomEvent approach (mylottoRecallSettings) if the user is
+ * already on the SKAI page or no destination URL is stored for this lottery.
+ * @param {HTMLElement} btn       - the button element that was clicked
+ * @param {number}      settingId - DB id of the saved settings row
+ * @param {number}      lotteryId - Lottery this template belongs to
+ */
+function mleApplyRecallSettings(btn, settingId, lotteryId) {
+  var raw = btn ? btn.getAttribute('data-mle-params') : null;
+  var params;
+  try { params = raw ? JSON.parse(raw) : null; } catch (e) { params = null; }
+  if (!params) { return; }
+
+  var destUrl  = (btn ? btn.getAttribute('data-mle-lottery-url') : null) || '';
+  var gameId   = (btn ? btn.getAttribute('data-mle-game-id')     : null) || '';
+  var source   = (btn ? btn.getAttribute('data-mle-source')       : null) || '';
+
+  // Build the recall payload to hand off to the SKAI page
+  var payload = {
+    settingId : settingId,
+    lotteryId : lotteryId,
+    gameId    : gameId,
+    source    : source,
+    params    : params
+  };
+
+  // If there is a known destination URL for this lottery, navigate there.
+  // The SKAI page will read the sessionStorage payload and auto-apply the settings.
+  if (destUrl && destUrl !== '' && destUrl !== '#') {
+    try {
+      sessionStorage.setItem('mle_recall_settings', JSON.stringify(payload));
+    } catch (ssErr) {
+      if (window.console) { console.warn('[MLE] sessionStorage unavailable:', ssErr); }
+    }
+    // Navigate; append a flag so the SKAI page knows to look for recall data
+    var sep = (destUrl.indexOf('?') === -1) ? '?' : '&';
+    window.location.href = destUrl + sep + 'mle_recall=1';
+    return;
+  }
+
+  // No destination URL — fall back to in-page fill (works if SKAI is on the same page)
+  if (typeof mylottoRecallSettings === 'function') {
+    mylottoRecallSettings(settingId, lotteryId, params);
+  }
+}
 
 /**
  * mylottoRecallSettings — populate the active prediction form with a saved settings template.
