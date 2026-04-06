@@ -13770,7 +13770,83 @@ $lotteryId              = isset($lotteryId) ? (int)$lotteryId : 0;
 // If $saveable was explicitly set earlier, keep it; otherwise, mirror the access flag.
 $saveable               = isset($saveable) ? (bool)$saveable : $userIsInAllowedGroup;
 
-$bestWindowN            = $bestWindowN ?? null;
+// [[SKAI_SAVED_TEMPLATES]] Load compatible My Lotto Expert saved settings for this user + lottery.
+// Only skai_prediction records are compatible with SKAI controls.
+// Sorted newest first; capped at 10 to keep the panel compact.
+$skaiSavedTemplates = [];
+if ((int)($user->id ?? 0) > 0 && (int)$lotteryId > 0) {
+    try {
+        $__sstQ = $db->getQuery(true)
+            ->select(['id', 'setting_name', 'params', 'created_at'])
+            ->from($db->quoteName('#__user_saved_settings'))
+            ->where($db->quoteName('user_id')    . ' = ' . (int)$user->id)
+            ->where($db->quoteName('lottery_id') . ' = ' . (int)$lotteryId)
+            ->where($db->quoteName('source')     . ' = ' . $db->quote('skai_prediction'))
+            ->order($db->quoteName('created_at') . ' DESC')
+            ->setLimit(10);
+        $db->setQuery($__sstQ);
+        $__sstRows = $db->loadAssocList() ?: [];
+        foreach ($__sstRows as $__sstRow) {
+            // Decode params; skip records with no usable data.
+            $__sstParams = json_decode((string)($__sstRow['params'] ?? ''), true);
+            if (!is_array($__sstParams) || empty($__sstParams)) { continue; }
+            // Validate setting_name; skip blank records.
+            $__sstName = trim((string)($__sstRow['setting_name'] ?? ''));
+            if ($__sstName === '') { continue; }
+            // Sanitize the params we will embed as JSON for the JS apply function.
+            // Whitelist only the fields that SKAI controls understand.
+            $__sstAllowedKeys = [
+                'profile', 'training_style', 'strategy', 'blend',
+                'skai_blend_ai_pct', 'skai_blend_skip_pct', 'blend_ai_pct', 'blend_skip_pct',
+                'ai_pct', 'skip_pct',
+                'epochs', 'batch_size', 'dropout_rate', 'learning_rate',
+                'activation_function', 'hidden_layers', 'recency_decay',
+                'skai_window_size', 'sampling_temperature', 'diversity_penalty',
+                'gap_scale', 'laplace_k', 'skai_run_mode',
+                'skai_top_n_numbers', 'skai_top_n_combos',
+            ];
+            $__sstSafe = [];
+            foreach ($__sstAllowedKeys as $__sstKey) {
+                if (isset($__sstParams[$__sstKey]) && $__sstParams[$__sstKey] !== '') {
+                    // Only scalar values; discard arrays/objects.
+                    if (is_scalar($__sstParams[$__sstKey])) {
+                        $__sstSafe[$__sstKey] = $__sstParams[$__sstKey];
+                    }
+                }
+            }
+            if (empty($__sstSafe)) { continue; }
+            // Build summary line for display.
+            $__sstProfile  = (string)($__sstSafe['profile'] ?? $__sstSafe['training_style'] ?? '');
+            $__sstStrategy = (string)($__sstSafe['strategy'] ?? '');
+            $__sstBlend    = null;
+            foreach (['skai_blend_ai_pct','blend_ai_pct','ai_pct'] as $__bk) {
+                if (isset($__sstSafe[$__bk]) && is_numeric($__sstSafe[$__bk])) {
+                    $__sstBlend = (int)round((float)$__sstSafe[$__bk]); break;
+                }
+            }
+            $__sstEpochs   = isset($__sstSafe['epochs']) && is_numeric($__sstSafe['epochs'])
+                             ? (int)$__sstSafe['epochs'] : null;
+            $__sstDate     = '';
+            $__sstTs       = strtotime((string)($__sstRow['created_at'] ?? ''));
+            if ($__sstTs) { $__sstDate = date('M j, Y', $__sstTs); }
+            $skaiSavedTemplates[] = [
+                'id'       => (int)$__sstRow['id'],
+                'name'     => $__sstName,
+                'profile'  => $__sstProfile,
+                'strategy' => $__sstStrategy,
+                'blend'    => $__sstBlend,
+                'epochs'   => $__sstEpochs,
+                'date'     => $__sstDate,
+                'params'   => $__sstSafe,
+            ];
+        }
+    } catch (Exception $__sstEx) {
+        // Non-fatal: panel simply shows empty state if query fails.
+        $skaiSavedTemplates = [];
+    }
+}
+
+$bestWindowN= $bestWindowN ?? null;
 $focusBest              = $focusBest   ?? null;
 $cvFocus                = $cvFocus     ?? [];
 
@@ -18429,6 +18505,81 @@ $escDrawDate = htmlspecialchars($formattedDrawDate, ENT_QUOTES, 'UTF-8');
   </div>
 <?php endif; ?>
 </div>
+
+<?php if ($skaiUiVisible && !empty($skaiSavedTemplates)): ?>
+<!-- [[SKAI_SAVED_TEMPLATES_PANEL]] Reuse a saved My Lotto Expert SKAI setup -->
+<div id="skai-saved-templates-panel"
+     style="margin:0 0 14px 0;border:1px solid rgba(28,102,255,0.22);border-radius:14px;background:#f8fbff;overflow:hidden;">
+  <div style="padding:12px 16px 10px 16px;border-bottom:1px solid rgba(28,102,255,0.12);">
+    <div style="font-size:0.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#1C66FF;margin-bottom:4px;">
+      Saved SKAI Settings
+    </div>
+    <div style="font-size:0.92rem;font-weight:700;color:#0A1A33;margin-bottom:2px;">
+      Reuse a Previous SKAI Configuration
+    </div>
+    <p style="font-size:0.82rem;color:#475569;margin:0;line-height:1.5;">
+      These are your saved SKAI configurations from My Lotto Expert for this lottery.
+      Click <strong>Load</strong> to apply a saved setup to the controls below, then run SKAI using those exact settings.
+    </p>
+  </div>
+  <div style="padding:10px 14px 12px 14px;display:flex;flex-direction:column;gap:8px;">
+    <?php foreach ($skaiSavedTemplates as $__tpl): ?>
+    <?php
+      // Build a safe JSON string for the inline onclick handler.
+      // json_encode with HEX_TAG and HEX_AMP keeps this safe inside an HTML attribute.
+      $__tplParamsJson = json_encode(
+          $__tpl['params'],
+          JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE
+      );
+      $__tplName     = htmlspecialchars($__tpl['name'],     ENT_QUOTES, 'UTF-8');
+      $__tplProfile  = htmlspecialchars(ucfirst((string)$__tpl['profile']),  ENT_QUOTES, 'UTF-8');
+      $__tplStrategy = htmlspecialchars((string)$__tpl['strategy'], ENT_QUOTES, 'UTF-8');
+      $__tplDate     = htmlspecialchars($__tpl['date'],     ENT_QUOTES, 'UTF-8');
+      $__tplBlend    = ($__tpl['blend'] !== null) ? (int)$__tpl['blend'] . '% AI' : '';
+      $__tplEpochs   = ($__tpl['epochs'] !== null) ? (int)$__tpl['epochs'] . ' epochs' : '';
+      $__tplMeta     = implode('  |  ', array_filter([$__tplProfile, $__tplStrategy, $__tplBlend, $__tplEpochs]));
+    ?>
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid rgba(28,102,255,0.14);border-radius:10px;background:#fff;">
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:0.88rem;font-weight:700;color:#0A1A33;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+             title="<?php echo $__tplName; ?>"><?php echo $__tplName; ?></div>
+        <?php if ($__tplMeta !== ''): ?>
+        <div style="font-size:0.78rem;color:#475569;margin-top:2px;"><?php echo $__tplMeta; ?></div>
+        <?php endif; ?>
+        <?php if ($__tplDate !== ''): ?>
+        <div style="font-size:0.75rem;color:#94a3b8;margin-top:1px;">Saved <?php echo $__tplDate; ?></div>
+        <?php endif; ?>
+      </div>
+      <button type="button"
+              class="skai-btn skai-btn--outline"
+              style="flex-shrink:0;font-size:0.8rem;padding:5px 12px;white-space:nowrap;"
+              onclick="if(typeof skaiApplySavedTemplate==='function'){skaiApplySavedTemplate(<?php echo $__tplParamsJson; ?>);}return false;"
+              aria-label="Load settings: <?php echo $__tplName; ?>">
+        Load
+      </button>
+    </div>
+    <?php endforeach; ?>
+  </div>
+  <div id="skai-saved-template-feedback"
+       role="status" aria-live="polite"
+       style="display:none;padding:6px 16px 10px 16px;font-size:0.82rem;font-weight:600;color:#065f46;"></div>
+</div>
+<?php endif; ?>
+
+<?php if ($skaiUiVisible && empty($skaiSavedTemplates) && (int)$lotteryId > 0 && (int)($user->id ?? 0) > 0): ?>
+<!-- [[SKAI_SAVED_TEMPLATES_EMPTY]] No saved SKAI templates found for this lottery -->
+<div id="skai-saved-templates-empty"
+     style="margin:0 0 14px 0;padding:10px 14px;border:1px dashed rgba(28,102,255,0.2);border-radius:12px;background:#f8fbff;">
+  <div style="font-size:0.78rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#1C66FF;margin-bottom:3px;">
+    Saved SKAI Settings
+  </div>
+  <p style="font-size:0.82rem;color:#475569;margin:0;line-height:1.5;">
+    No saved SKAI configurations found for this lottery yet.
+    After you run SKAI and save a prediction, your settings will appear here so you can reload them for future runs.
+  </p>
+</div>
+<?php endif; ?>
+
 <!-- Ensure the options container is not inside a form; if it is, explicit button types prevent accidental submits -->
 <div id="skai-run-options" class="tile" aria-labelledby="skai-run-options-title" style="margin:10px 0 14px 0; display:none;">
 <h4 id="skai-run-options-title" style="margin:0 0 8px 0">
@@ -28870,6 +29021,206 @@ strat = strat || 'N/A';
     // return useful info if any caller wants it
     return { profile: prof, strategy: strat, blendText: blend.text };
   }
+
+  // [[SKAI_APPLY_SAVED_TEMPLATE]]
+  // Maps a saved My Lotto Expert SKAI settings record (params object from #__user_saved_settings)
+  // into the active SKAI controls.  Called by the "Load" buttons in the Saved SKAI Settings panel.
+  //
+  // Field mapping (MLE saved key -> SKAI control):
+  //   profile / training_style  -> applyProfile() + profile button active state
+  //   strategy                  -> setStrategy() + strategy button active state
+  //   skai_blend_ai_pct /
+  //     blend_ai_pct / ai_pct   -> setBlend() + blend slider
+  //   epochs                    -> skaiadv_epochs slider + hidden input
+  //   batch_size                -> skaiadv_batch slider + hidden input
+  //   dropout_rate              -> skaiadv_dropout slider + hidden input
+  //   learning_rate             -> skaiadv_lr slider + hidden input
+  //   hidden_layers             -> skaiadv_layers slider + hidden input
+  //   recency_decay             -> skaiadv_decay slider + hidden input
+  //   skai_window_size          -> skaiadv_window slider + hidden input
+  //   activation_function       -> skaiadv_activation select
+  //   sampling_temperature      -> skaiadv_temp slider
+  //   diversity_penalty         -> skaiadv_diversity slider
+  //   gap_scale                 -> skaiadv_gap slider
+  //   skai_run_mode             -> hidden input skai-ai-run-mode
+  //   skai_top_n_numbers        -> hidden input skai-ai-top-n-numbers
+  //   skai_top_n_combos         -> hidden input skai-ai-top-n-combos
+  //
+  // Missing or non-numeric fields are silently skipped; no existing state is corrupted.
+  window.skaiApplySavedTemplate = function skaiApplySavedTemplate(params) {
+    if (!params || typeof params !== 'object') { return; }
+
+    // -- Helpers ----------------------------------------------------------------
+
+    // Fire input + change so any live sync/display listeners react.
+    function fireEvents(el) {
+      if (!el) { return; }
+      try {
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch (_) {}
+    }
+
+    // Set a range slider + its companion number input, then fire events.
+    function setSlider(sliderId, numId, val) {
+      var slider = document.getElementById(sliderId);
+      var num    = document.getElementById(numId);
+      if (slider) { slider.value = String(val); fireEvents(slider); }
+      if (num)    { num.value    = String(val); fireEvents(num); }
+    }
+
+    // Set a plain hidden input value.
+    function setHidden(id, val) {
+      var el = document.getElementById(id);
+      if (el) { el.value = String(val); fireEvents(el); }
+    }
+
+    // Safely parse a numeric value; return null if not valid.
+    function num(v, min, max) {
+      var n = parseFloat(v);
+      if (!isFinite(n)) { return null; }
+      if (min !== undefined && n < min) { n = min; }
+      if (max !== undefined && n > max) { n = max; }
+      return n;
+    }
+
+    var applied = 0;
+
+    // -- Profile ---------------------------------------------------------------
+    var profile = String(params.profile || params.training_style || '').toLowerCase().trim();
+    if (profile && typeof applyProfile === 'function') {
+      // Normalize common aliases
+      if (profile === 'conservative') { profile = 'conservative'; }
+      else if (profile === 'explorative' || profile === 'aggressive') { profile = 'explorative'; }
+      else { profile = 'balanced'; }
+      try { applyProfile(profile); applied++; } catch (_) {}
+      // Also activate the matching profile button for visual consistency
+      try {
+        var profBtns = document.querySelectorAll('[data-profile]');
+        for (var pi = 0; pi < profBtns.length; pi++) {
+          var pb = profBtns[pi];
+          var isMatch = (pb.getAttribute('data-profile') === profile);
+          pb.classList.toggle('is-active', isMatch);
+          pb.setAttribute('aria-pressed', isMatch ? 'true' : 'false');
+        }
+      } catch (_) {}
+    }
+
+    // -- Strategy --------------------------------------------------------------
+    var strategy = String(params.strategy || '').toLowerCase().trim();
+    if (strategy && typeof setStrategy === 'function') {
+      // Normalize
+      if (strategy === 'ai' || strategy === 'ai-forward' || strategy === 'ai_forward') { strategy = 'ai'; }
+      else if (strategy === 'skip' || strategy === 'skip_pattern' || strategy === 'skip-pattern') { strategy = 'skip'; }
+      else { strategy = 'hybrid'; }
+      try { setStrategy(strategy); applied++; } catch (_) {}
+      // Activate matching strategy button
+      try {
+        var stratBtns = document.querySelectorAll('[data-strategy]');
+        for (var si = 0; si < stratBtns.length; si++) {
+          var sb = stratBtns[si];
+          var stratMatch = (sb.getAttribute('data-strategy') === strategy);
+          sb.classList.toggle('is-active', stratMatch);
+          sb.setAttribute('aria-pressed', stratMatch ? 'true' : 'false');
+        }
+      } catch (_) {}
+    }
+
+    // -- Blend -----------------------------------------------------------------
+    var blendRaw = params.skai_blend_ai_pct || params.blend_ai_pct || params.ai_pct || null;
+    var blendVal = num(blendRaw, 0, 100);
+    if (blendVal !== null && typeof setBlend === 'function') {
+      try { setBlend(Math.round(blendVal)); applied++; } catch (_) {}
+    }
+
+    // -- Advanced slider controls ----------------------------------------------
+    var epochsVal = num(params.epochs, 1, 500);
+    if (epochsVal !== null) {
+      setSlider('skaiadv_epochs', 'skaiadv_epochs_num', Math.round(epochsVal)); applied++;
+    }
+
+    var batchVal = num(params.batch_size, 1, 512);
+    if (batchVal !== null) {
+      setSlider('skaiadv_batch', 'skaiadv_batch_num', Math.round(batchVal)); applied++;
+    }
+
+    var dropoutVal = num(params.dropout_rate, 0, 0.6);
+    if (dropoutVal !== null) {
+      setSlider('skaiadv_dropout', 'skaiadv_dropout_num', dropoutVal); applied++;
+    }
+
+    var lrVal = num(params.learning_rate, 0.000001, 0.1);
+    if (lrVal !== null) {
+      setSlider('skaiadv_lr', 'skaiadv_lr_num', lrVal); applied++;
+    }
+
+    var layersVal = num(params.hidden_layers, 1, 12);
+    if (layersVal !== null) {
+      setSlider('skaiadv_layers', 'skaiadv_layers_num', Math.round(layersVal)); applied++;
+    }
+
+    var decayVal = num(params.recency_decay, 0, 0.999);
+    if (decayVal !== null) {
+      setSlider('skaiadv_decay', 'skaiadv_decay_num', decayVal); applied++;
+    }
+
+    var windowVal = num(params.skai_window_size, 5, 500);
+    if (windowVal !== null) {
+      setSlider('skaiadv_window', 'skaiadv_window_num', Math.round(windowVal)); applied++;
+    }
+
+    var tempVal = num(params.sampling_temperature, 0.5, 1.5);
+    if (tempVal !== null) {
+      setSlider('skaiadv_temp', 'skaiadv_temp_num', tempVal); applied++;
+    }
+
+    var divVal = num(params.diversity_penalty, 0, 0.1);
+    if (divVal !== null) {
+      setSlider('skaiadv_diversity', 'skaiadv_diversity_num', divVal); applied++;
+    }
+
+    var gapVal = num(params.gap_scale, 0, 1);
+    if (gapVal !== null) {
+      setSlider('skaiadv_gap', 'skaiadv_gap_num', gapVal); applied++;
+    }
+
+    // -- Activation function select --------------------------------------------
+    var actRaw = String(params.activation_function || '').toLowerCase().trim();
+    var validAct = { tanh: 1, relu: 1, elu: 1, sigmoid: 1 };
+    if (actRaw && validAct[actRaw]) {
+      var actSel = document.getElementById('skaiadv_activation');
+      if (actSel) { actSel.value = actRaw; fireEvents(actSel); applied++; }
+    }
+
+    // -- Hidden inputs ---------------------------------------------------------
+    if (params.skai_run_mode) {
+      setHidden('skai-ai-run-mode', params.skai_run_mode); applied++;
+    }
+    var topN = num(params.skai_top_n_numbers, 1, 100);
+    if (topN !== null) {
+      setHidden('skai-ai-top-n-numbers', Math.round(topN)); applied++;
+    }
+    var topC = num(params.skai_top_n_combos, 1, 50);
+    if (topC !== null) {
+      setHidden('skai-ai-top-n-combos', Math.round(topC)); applied++;
+    }
+
+    // -- User feedback ---------------------------------------------------------
+    var fb = document.getElementById('skai-saved-template-feedback');
+    if (fb) {
+      fb.style.display = 'block';
+      fb.textContent   = applied > 0
+        ? 'Settings loaded. Review the controls below and click Run to use them.'
+        : 'Settings could not be applied (no compatible fields found).';
+      // Auto-hide after 5 seconds
+      try {
+        clearTimeout(fb._hideTimer);
+        fb._hideTimer = setTimeout(function () {
+          fb.style.display = 'none';
+        }, 5000);
+      } catch (_) {}
+    }
+  };
 
   function applyProfile(p){
     var spec = PRESETS[p]; if (!spec) return;
