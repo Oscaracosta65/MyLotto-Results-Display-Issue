@@ -2495,10 +2495,12 @@ if ($id > 0) {
 
     // Save prediction settings as a named template (hardened: use Joomla input filtering)
     if ($app->input->post->get('save_setting_template', '', 'STRING') !== '') {
-        $settingName = trim($app->input->post->getString('setting_name', ''));
-        $source      = $app->input->post->getString('source', '');
-        $lotteryId   = $app->input->post->getInt('lottery_id', 0);
-        $params      = [];
+        $settingName     = trim($app->input->post->getString('setting_name', ''));
+        $source          = $app->input->post->getString('source', '');
+        $lotteryId       = $app->input->post->getInt('lottery_id', 0);
+        // [[FIX]] Use a scoped name to avoid clobbering the Joomla Registry $params
+        // that the module framework injects and that is used later at render time.
+        $__sstParamsData = [];
 
         // Define expected params based on source
         $keys = match ($source) {
@@ -2534,7 +2536,7 @@ if ($id > 0) {
         foreach ($keys as $k) {
             $val = $app->input->post->get($k, null, 'STRING'); // keep as STRING to avoid behavior changes
             if ($val !== null && $val !== '') {
-                $params[$k] = $val;
+                $__sstParamsData[$k] = $val;
             }
         }
 
@@ -2543,20 +2545,20 @@ if ($id > 0) {
         //   Training Style / Strategy / Mode / Blend
         foreach (['training_style', 'profile', 'strategy', 'skai_run_mode', 'blend',
                   'skai_blend_skip_pct', 'skai_blend_ai_pct'] as $__identKey) {
-            if (!array_key_exists($__identKey, $params)) {
+            if (!array_key_exists($__identKey, $__sstParamsData)) {
                 $__iv = $app->input->post->get($__identKey, null, 'STRING');
                 if ($__iv !== null && $__iv !== '') {
-                    $params[$__identKey] = $__iv;
+                    $__sstParamsData[$__identKey] = $__iv;
                 }
             }
         }
         // Capture the page/context this was saved from (Sky, AI, etc.) for recall display.
         $__pageSaved = trim($app->input->post->getString('page_saved_from', ''));
         if ($__pageSaved !== '') {
-            $params['page_saved_from'] = substr($__pageSaved, 0, 64);
+            $__sstParamsData['page_saved_from'] = substr($__pageSaved, 0, 64);
         }
 
-        if ($settingName && $source && $lotteryId && $params) {
+        if ($settingName && $source && $lotteryId && $__sstParamsData) {
             $q = $db->getQuery(true)
                 ->insert($db->quoteName('#__user_saved_settings'))
                 ->columns(['user_id', 'lottery_id', 'source', 'setting_name', 'params'])
@@ -2565,7 +2567,7 @@ if ($id > 0) {
                     $lotteryId,
                     $db->quote($source),
                     $db->quote($settingName),
-                    $db->quote(json_encode($params, JSON_UNESCAPED_UNICODE))
+                    $db->quote(json_encode($__sstParamsData, JSON_UNESCAPED_UNICODE))
                 ]));
 
             $db->setQuery($q);
@@ -2576,6 +2578,10 @@ if ($id > 0) {
                 $app->enqueueMessage('Failed to save: ' . $e->getMessage(), 'error');
             }
         }
+        // [[FIX]] Always redirect after save (Post-Redirect-Get) to prevent double-submit
+        // and to ensure execution never falls through to render code with $__sstParamsData in scope.
+        $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
+        exit;
     }
 
     // Module keys needed for save_strategy_set source whitelisting below.
